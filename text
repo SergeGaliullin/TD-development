@@ -1,0 +1,2793 @@
+import datetime
+import random
+from decimal import Decimal
+
+from django.conf import settings
+from django.core.urlresolvers import reverse
+from django.http import HttpResponse, HttpResponseRedirect
+from django.views.generic import FormView, TemplateView, View
+
+from django.forms.forms import NON_FIELD_ERRORS
+from django.forms.util import ErrorList
+
+try:
+    from django.utils import simplejson as json
+except:
+    import simplejson as json
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from django.shortcuts import redirect
+from django.template.loader import render_to_string
+from django.db.models import Q
+from django.contrib.sites.models import RequestSite, Site
+from django.utils import translation
+
+from promotions.models import Promotion, PromotionUsage
+from participants.models import Participant, SourceOption
+from participants.views import RegisterUserView
+from core.utils import (
+    get_challenge_from_session, get_promos_from_session, get_amount_from_session,
+    calculate_total, activate_language
+)
+from teams.models import Team, Teammate, HwagerExtension
+from challenges.models import Challenge, NameYourOwnPrize, ChallengeProperty
+from timeline import tasks
+from referrals.models import Referral
+from landing_pages.session_utils import LandingPage, get_prize_boost_from_last_visited_landing_page
+
+from braces.views import LoginRequiredMixin, JSONResponseMixin
+
+from .forms import PaymentForm, PaymentExtrasForm, AddCardForm
+from .models import CreditCard, Subscription, Receipt, PaymentRequestLog
+from .utils import process_installment_amounts, charge_subscription
+from registration.models import RegistrationProfile
+from challenges.utils import calculate_nyop_prize, convert_goal_to_percentage
+from core.utils import calculate_bmi
+from ledgers.models import Ledger
+
+import braintree
+from django.utils.translation import ugettext_lazy as _
+from dateutil.relativedelta import relativedelta
+from landing_pages.const import HWGAER_EXTENSION_LENGTH
+from winners.models import Winner
+
+import logging
+
+buy_more_time_logger = logging.getLogger('logger_buy_more_time')
+
+
+# from participants.serializers import SourceOptionSerializer
+
+
+class CreditCardUpdateView(LoginRequiredMixin, JSONResponseMixin, TemplateView):
+    template_name = "participants/dashboard/profile/_payment_form.html"
+    success_template = "participants/dashboard/profile/_credit_card_summary.html"
+
+    def post(self, request, *args, **kwargs):
+        context = {}
+        activate_language(self.request)
+        language = translation.get_language()
+        json_resp = {
+            'success': False,
+        }
+
+        form = AddCardForm(request.POST)
+        user = request.user
+
+        if form.is_valid():
+            try:
+                result = braintree.Customer.create({
+                    "first_name": form.cleaned_data['first_name'],
+                    "last_name": form.cleaned_data['last_name'],
+                })
+
+                if result.is_success:
+                    card_result = braintree.CreditCard.create({
+                        "customer_id": result.customer.id,
+                        "cardholder_name": form.cleaned_data['first_name'] + ' ' + form.cleaned_data['last_name'],
+                        "number": form.cleaned_data['number'],
+                        "cvv": form.cleaned_data['cvv'],
+                        "expiration_month": form.cleaned_data['expiration_month'],
+                        "expiration_year": form.cleaned_data['expiration_year'],
+                        "options": {
+                            "verify_card": True,
+                        }
+                    })
+
+                    if card_result.is_success:
+                        credit_card = CreditCard(
+                            participant=self.request.user,
+                            token=card_result.credit_card.token,
+                            last_four=card_result.credit_card.last_4,
+                            type=card_result.credit_card.card_type,
+                            cardholder=card_result.credit_card.cardholder_name,
+                            postal_code=form.cleaned_data['postal_code'],
+                            expiration_month=card_result.credit_card.expiration_month,
+                            expiration_year=card_result.credit_card.expiration_year
+                        )
+                        credit_card.save()
+
+                        # charge arrears status on subscriptions for user..
+                        subscriptions = Subscription.objects.filter(
+                            participant=self.request.user,
+                            arrears=True,
+                        )
+                        for s in subscriptions:
+                            sub = charge_subscription(s, credit_card)
+
+                        # change referrals for this user to accepted
+                        """referrals = Referral.objects.filter(referred_email=self.request.user.email)
+                        for referral in referrals:
+                            referral.status = 'a'
+                            referral.save()"""
+
+                        all_cards = CreditCard.objects.filter(participant=user)
+
+                        for card in all_cards:
+                            if card.id == credit_card.id:
+                                continue
+
+                            if card.subscription_set.all():
+                                for subscription in card.subscription_set.all():
+                                    subscription.card = credit_card
+                                    subscription.save()
+
+                            card.delete()
+
+                        context['credit_card'] = credit_card
+                        json_resp['content'] = render_to_string(self.success_template, context)
+                        json_resp['success'] = True
+            except:
+                json_resp['success'] = False
+
+        return self.render_json_response(json_resp)
+
+    def get(self, request, *args, **kwargs):
+        '''
+        Get the form for adding more weight objects
+        '''
+        context = {}
+        activate_language(self.request)
+        language = translation.get_language()
+        context['form'] = AddCardForm()
+        response = render_to_string(self.template_name, context)
+
+        return self.render_json_response(response)
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, *args, **kwargs):
+        return super(CreditCardUpdateView, self).dispatch(*args, **kwargs)
+
+
+class SaveCardSession(JSONResponseMixin, View):
+    def post(self, request):
+        request.session['save_card'] = True
+        return self.render_json_response({})
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, *args, **kwargs):
+        return super(SaveCardSession, self).dispatch(*args, **kwargs)
+
+
+class UseCard(JSONResponseMixin, View):
+
+    def hw_point_calculation(self, fee, chal_amount):
+        hw_points = self.request.user.user_hw_point_balance()
+        remaining_balance = chal_amount - hw_points
+        remaining_hw_point = abs(remaining_balance) if remaining_balance < 0 else 0
+        hw_points_use = chal_amount if remaining_hw_point else hw_points
+        chal_amount = chal_amount - hw_points
+        chal_amount = abs(chal_amount) if chal_amount >= 0 else 0
+        return hw_points, remaining_balance, chal_amount, remaining_hw_point, hw_points_use
+
+    def post(self, request, *args, **kwargs):
+        return_dict = {
+            'success': False,
+        }
+        if request.user.is_authenticated():
+            #User must be authenticated to proceed
+            user = request.user
+        else:
+            # Redirect to home page if user is not authenticated
+            return HttpResponseRedirect("/")
+
+        challenge = get_challenge_from_session(self.request)
+
+        if not challenge:
+            return self.render_json_response(return_dict)
+
+        buy_more_time = self.request.POST.get('extend_limit', False)
+        if buy_more_time == 'True':
+            buy_more_time = True
+        else:
+            buy_more_time = False
+        payment_request = True
+        if challenge and challenge.challenge_type.slug == 'name-your-own-prize':
+            nyop_record = NameYourOwnPrize.objects.filter(participant_id = user.id, is_active = True)
+            if nyop_record and user.is_user_in_nyop_challenge() and not buy_more_time:
+                return HttpResponseRedirect("/dashboard/")
+
+        if buy_more_time:
+            teammate = Teammate.objects.filter(participant=user, team__challenge__challenge_type__slug = 'name-your-own-prize', status__in=["ac", "cm", "de", "rp", "tt"])
+            if teammate:
+                teammate = teammate[0]
+                team = teammate.team
+            else:
+                return HttpResponseRedirect("/challenge/directory")
+
+
+        promos = get_promos_from_session(request)
+        amount = get_amount_from_session(request)
+
+        active_bet_id = request.POST.get('active_bet', None)
+        daily_step_goal = request.session.get('daily_step_goal', False)
+        if buy_more_time:
+            active_bet = self.request.user.nyop_teammate_active_bet()
+        elif request.session.get('nyop_amount', False):
+            if active_bet_id:
+                active_bet = NameYourOwnPrize.objects.filter(pk=active_bet_id,participant=user)
+                if active_bet:
+                    active_bet = active_bet[0]
+                    goal_percentage = convert_goal_to_percentage(active_bet.goal, active_bet.weight_in_lbs)
+                    height_feet = int(active_bet.height_inches_total/12)
+                    height_inches = int(active_bet.height_inches_total%12)
+                    bmi = calculate_bmi(height_feet, height_inches, float(active_bet.weight_in_lbs))
+                    prize = calculate_nyop_prize(active_bet.gender, bmi, float(goal_percentage), int(active_bet.wager), int(active_bet.length), float(active_bet.goal), active_bet.height_inches_total, active_bet.waist, active_bet.weight_in_lbs)
+                    active_bet.prize = prize
+                    active_bet.save()
+                else:
+                    return HttpResponseRedirect("/weight-loss-bet/prize/")
+
+        if challenge:
+            if challenge.challenge_type.slug == 'name-your-own-prize' and not request.session.get('nyop_amount', False) and not buy_more_time:
+                return HttpResponseRedirect(reverse('registration_register'))
+        # pull org if it exists (this will be applied to the
+        # specific teammate object)
+        org = request.session.get('tmp_reg_employer', False)
+        org_rel = request.session.get('tmp_reg_employer_relationship', False)
+        alternate_email_address = request.session.get('tmp_reg_alternate_email_address', False)
+        org_rel_cut_field_value =  request.session.get('tmp_reg_custom_field_name',False)
+        org_rel_cut_field_name = request.session.get('tmp_reg_custom_field_label',False)
+        org_add_info_question = request.session.get('tmp_reg_employer_infoquestion',False)
+        org_add_info_option = request.session.get('tmp_reg_employer_infooption',False)
+        campaign = request.session.get('tmp_reg_campaign', False)
+
+        if amount:
+            if challenge.challenge_type.slug == 'name-your-own-prize':
+                if active_bet:
+                    if buy_more_time:
+                        challenge_cost = (active_bet.wager*HWGAER_EXTENSION_LENGTH)
+                    else:
+                        challenge_cost = (active_bet.wager*active_bet.length)
+            else:
+                challenge_cost = challenge.cost
+        elif challenge.challenge_type.slug == 'name-your-own-prize' and buy_more_time:
+            challenge_cost = (active_bet.wager*HWGAER_EXTENSION_LENGTH)
+        else:
+            challenge_cost = calculate_total(challenge, promos)
+
+
+        pay_method = request.POST.get('optionsRadios', 'single')
+        postal_code = request.POST.get('postal_code', None)
+        synchronizer_token = request.POST.get('synchronizer_token', None)
+
+        card_id = request.POST.get('card_id')
+        card = CreditCard.objects.get(id=card_id)
+        timeframe = 3
+        #create amounts to send to braintree
+        if challenge.challenge_type.slug == 'name-your-own-prize':
+            fee = challenge_cost
+        else:
+            fee = challenge.cost
+        hw_points, remaining_balance, challenge_cost, remaining_hw_point, hw_points_use = self.hw_point_calculation(fee, challenge_cost)
+
+        if pay_method == "single":
+            # lump sum payment
+            pay_amount = Decimal(challenge_cost)
+            subscription = None
+        else:
+            challenge_installment = challenge.installment
+            # installment payment (setup new subscription)
+            if challenge.challenge_type.slug == 'name-your-own-prize':
+                if active_bet:
+                    if buy_more_time:
+                        timeframe = HWGAER_EXTENSION_LENGTH
+                    else:
+                        timeframe = active_bet.length
+                    installment_amount, odd_payment = process_installment_amounts(float(challenge_cost), timeframe)
+                    if odd_payment:
+                        pay_amount = u"%s" % ("{0:.2f}".format(odd_payment))
+                    else:
+                        pay_amount = u"%s" % ("{0:.2f}".format(installment_amount))
+            else:
+                if not challenge_installment == 0:
+                    timeframe = challenge_installment
+                    installment_amount, odd_payment = process_installment_amounts(Decimal(challenge_cost), challenge_installment)
+
+                if odd_payment:
+                    pay_amount = u"%s" % ("{0:.2f}".format(odd_payment))
+                else:
+                    pay_amount = u"%s" % ("{0:.2f}".format(installment_amount))
+
+        result = False
+        payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="before-braintree-call", method="old-card")
+        if request.session.get('synchronizer_token', False):
+            if request.session.get('tmp_reg_challenges', False):
+                del request.session['synchronizer_token']
+                if payment_request:
+                    payment_request = False
+                    result = braintree.Transaction.sale({
+                        "payment_method_token": card.token,
+                        "amount": pay_amount,
+                        "options": {
+                            "submit_for_settlement": True
+                        },
+                    })
+                    if result and result.is_success:
+                        del request.session['tmp_reg_challenges']
+
+        if result and result.is_success:
+            payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="payment-successful", method="old-card")
+            request.session['event_tracking'] = True
+            if challenge.challenge_type.slug == 'team-challenge':
+                # set check for team formation
+                request.session['team_formation'] = True
+
+            elif challenge.challenge_type.slug in settings.JACKPOT_CHALLENGES:
+                # set check for team formation
+                request.session['team_formation_jackpot'] = True
+                request.session['session_challenge'] = challenge
+
+            return_dict['success'] = True
+
+            user = request.user
+            if alternate_email_address:
+                existing_email = user.email
+                user.email = alternate_email_address
+                user.alternate_email_address = existing_email
+                user.save()
+
+            # change referrals for this user to accepted
+            """referrals = Referral.objects.filter(referred_email=user.email)
+            for referral in referrals:
+                referral.status = 'a'
+                referral.save()"""
+
+            # DEV - 1041 Update referral System
+            unique_id = request.session.get('unique_id', False)
+            referral = request.session.get('ref_active_hw_id', False)
+            Cid = request.session.get('ref_active_Cid', False)
+            method = request.session.get('ref_active_social_method',False)
+            referral_url = request.session.get('referral_url',False)
+            if unique_id:
+                cha_id = Challenge.objects.get(id=Cid)
+                value = cha_id.referral_amount
+                participant = Participant.objects.get(email=user.email)
+                receipt_record = Receipt.objects.filter(participant_id=participant.id)
+
+            if unique_id:
+                obj = Referral.objects.filter(referrer=Participant.objects.get(healthywage_id=referral),referred_email=user.email,status='a',challenge_id=Cid)
+                referrer=Participant.objects.get(healthywage_id=referral)
+                if receipt_record and not obj and referrer.email != user.email:
+                    if (challenge.cost > 0 or challenge.challenge_type.slug == 'name-your-own-prize') and Cid == challenge.id:
+                        try:
+                            refs = Referral.objects.filter(
+                                referred_email=user.email,
+                                unique_id=unique_id,
+                                status='p',
+                                challenge_id=Cid,
+                            ).latest('created')
+                            if challenge.challenge_type.slug == 'name-your-own-prize':
+                                try:
+                                    create_ledger = False
+                                    winner = False
+                                    nyop_winner = False
+                                    teammates = Teammate.objects.filter(participant=refs.referrer,team__challenge__challenge_type__slug='name-your-own-prize', status__in=['tt','cm','de','ac','wi'])
+                                    teammate = teammates.exclude(status='wi').order_by('-created')
+                                    winner_teammate = teammates.filter(status='wi').order_by('-created')
+                                    winners = Winner.objects.filter(participant=refs.referrer,challenge__challenge_type__slug='name-your-own-prize')
+
+                                    if winner_teammate:
+                                        nyop_winner = winners.filter(teammate=winner_teammate[0]).order_by('-created')
+                                    if teammate:
+                                        winner = winners.filter(teammate=teammate[0]).order_by('-created')
+                                        create_ledger = refs.created < teammate[0].created
+
+                                    if teammate or (winner and winner[0].status in ["possible", "pending", "payable"]) and not create_ledger:
+                                        refs.status = 'a'
+                                        refs.save()
+                                        if winner:
+                                            winner = winner[0]
+                                            winner.prize_amount_override = teammate.total_payout_for_hwager()
+                                            winner.save()
+
+                                    elif (nyop_winner and nyop_winner[0].status == 'paid') or (create_ledger and nyop_winner and nyop_winner[0].status == 'paid'):
+                                        refs.status = 'a'
+                                        Ledger().create_ledger_record(refs.referrer, 0, refs.value, 'pm', 'ra', refs.id,status='vb')
+
+                                    else:
+                                        refs.status = 'l'
+                                except:
+                                    refs.status = 'l'
+                            else:
+                                refs.status = 'a'
+                            refs.save()
+                            referrer_person = refs.referrer
+                        except Referral.DoesNotExist:
+                            referral = Referral(
+                                referrer=Participant.objects.get(healthywage_id=referral),
+                                challenge=cha_id,
+                                value=value,
+                                referred_email=user.email,
+                                referred_name=user.get_full_name(),
+                                medium=method,
+                                unique_id=unique_id
+                            )
+                            referral.save()
+                            referrer_person = referral.referrer
+                            if challenge.challenge_type.slug == 'name-your-own-prize':
+                                try:
+                                    winner = False
+                                    nyop_winner = False
+                                    teammates = Teammate.objects.filter(participant=refs.referrer,team__challenge__challenge_type__slug='name-your-own-prize',status__in=['tt','cm','de','ac','wi'])
+                                    teammate = teammates.exclude(status='wi').order_by('-created')
+                                    winner_teammate = teammates.filter(status='wi').order_by('-created')
+                                    winners = Winner.objects.filter(participant=refs.referrer,challenge__challenge_type__slug='name-your-own-prize')
+                                    if teammate:
+                                        winner = winners.filter(teammate=teammate[0]).order_by('-created')
+                                    if winner_teammate:
+                                        nyop_winner = winners.filter(teammate=winner_teammate[0]).order_by('-created')
+
+                                    if teammate or (winner and winner[0].status in ["possible", "pending", "payable"]):
+                                        referral.status = 'a'
+                                        referral.save()
+                                        if winner:
+                                            winner = winner[0]
+                                            winner.prize_amount_override = teammate.total_payout_for_hwager()
+                                            winner.save()
+                                    elif not teammate and nyop_winner and nyop_winner[0].status == 'paid':
+                                        referral.status = 'a'
+                                        Ledger().create_ledger_record(referral.referrer, 0, referral.value, 'pm', 'ra',referral.id, status='vb')
+
+                                    else:
+                                        referral.status = 'l'
+                                except:
+                                    referral.status = 'l'
+                            else:
+                                referral.status = 'a'
+                            referral.save()
+
+                        # DEV - 1123
+                        referrer_teammate = Teammate.objects.get(participant = referrer_person, team__challenge=Cid, status__in=['ac', 'cm', 'wi', 'rp', 'cl'])
+                        referrer_team = referrer_teammate.team
+                        if cha_id.challenge_type.slug == 'name-your-own-prize':
+                            referrer_teammate = Teammate.objects.get(participant = referrer_person, team__challenge=Cid, status__in=['ac', 'cm', 'wi', 'rp', 'cl'])
+                            referrer_team = referrer_teammate.team
+                        if challenge.challenge_type.slug == 'name-your-own-prize' or challenge.challenge_type.slug != 'name-your-own-prize':
+                            if cha_id.challenge_type.slug == 'name-your-own-prize':
+                                referrals = Referral.objects.filter(referrer=referrer_person,status='a',challenge = referrer_team.challenge)
+                                referred_amount = cha_id.referred_amount
+                                if referrals:
+                                    tasks.task_timeline_event(
+                                        email={
+                                            "to": referrer_person.email,
+                                            "name": "email-347",
+                                        },
+                                        notification=None,
+                                        context={
+                                            'referred_email': user.email,
+                                            'participant': user.id,
+                                            'referrer_name': referrer_person.get_first_name(),
+                                            'referrer_team':referrer_team.id,
+                                            'referral_url':referral_url,
+                                            'referral_bonus':value,
+                                            'request': '',
+                                            'teammate': referrer_teammate.id,
+                                            'referred_amount': referred_amount,
+                                        }
+                                    )
+                                    print "Email email-347 sent to : " + str(referrer_teammate.participant.email)
+                            elif cha_id.challenge_type.slug == 'team-challenge':
+                                tasks.task_timeline_event(
+                                    email={
+                                        "to": referrer_person.email,
+                                        "name": "TC Referral Confirmation Email",
+                                    },
+                                    notification=None,
+                                    context={
+                                        'referred_email': user.email,
+                                        'participant': user.id,
+                                        'referrer_name': referrer_person.get_first_name(),
+                                        'referrer_team':referrer_team.id,
+                                        'referral_url':referral_url,
+                                        'challenge':referrer_team.challenge.id,
+                                        'request': '',
+                                        'teammate': referrer_teammate.id,
+                                    }
+                                )
+                            elif cha_id.challenge_type.slug in ['jackpot','weight-watchers','million-step-challenge','jackpot-2-challenge']:
+                                if cha_id.challenge_type.slug == 'weight-watchers':
+                                    jackpot_referral_confirm = "Jackpot Referral Confirmation Email-ww"
+                                elif cha_id.challenge_type.slug == 'jackpot-2-challenge':
+                                    jackpot_referral_confirm = "email-759"
+                                else:
+                                    jackpot_referral_confirm = "Jackpot Referral Confirmation Email"
+                                tasks.task_timeline_event(
+                                    email={
+                                        "to": referrer_person.email,
+                                        "name": jackpot_referral_confirm,
+                                    },
+                                    notification=None,
+                                    context={
+                                        'referred_email': user.email,
+                                        'participant': user.id,
+                                        'referrer_name': referrer_person.get_first_name(),
+                                        'referrer_team':referrer_team.id,
+                                        'referral_url':referral_url,
+                                        'request': '',
+                                        'teammate': referrer_teammate.id,
+                                    }
+                                )
+
+            if not buy_more_time:
+                if user.first_name and user.last_name:
+                    team_name = user.get_short_name().replace(".", "").replace(". ", "").replace(" .", "") + "'s Fantastic Team"
+                else:
+                    team_name = user.email
+
+                # create a team for the challenge
+                if challenge.challenge_type.slug == 'name-your-own-prize' and request.session.get('nyop_amount', False):
+                    if active_bet:
+                        if request.session.get('repeaters', False) or request.session.get('tmp_reg_campaign', False) == 'pandora'  or request.session.get('slickdeals', False) or request.session.get('100_offer_lp', False):
+                            active_bet.prize += 100
+                        elif request.session.get('msmom', False) or request.session.get('abc_13', False) or request.session.get('coupon_mom_lp', False) or request.session.get('1_sale', False) or request.session.get('reddit', False):
+                            active_bet.prize += 50
+                        elif request.session.get('vday', False) or request.session.get('st_patty', False):
+                            active_bet.prize += 30
+                        elif request.session.get('new_experimenter', False) or request.session.get('exclusive40', False):
+                            active_bet.prize += 40
+                        active_bet.is_active = True
+                        active_bet.save()
+                    team = Team.objects.create(
+                        creator=user,
+                        challenge=challenge,
+                        name=team_name
+                    )
+                    created = True
+                else:
+                    team, created = Team.objects.get_or_create(
+                        creator=user,
+                        challenge=challenge,
+                    )
+                if created:
+                    if challenge.challenge_type.slug in ['step-challenge-2','step-challenge-3','weight-watchers-step-challenge','step-challenge-4']:
+                        team.team_step_goal = team.team_goal()
+                    team.name = team_name
+                    team.save()
+
+                # make a teammate object to serve as captain
+                teammate = Teammate.objects.filter(team=team,participant=user,captain=True, status__in=["ac", "cm", "tt"])
+                if not teammate:
+                    request.session['initial_overlay_status'] = challenge.id
+                    teammate = Teammate(request=request)
+                    teammate.team=team
+                    teammate.participant=user
+                    teammate.captain=True
+                    # if there is an organization add it to the teammate
+                    if teammate.team.challenge.challenge_type.slug == 'team-challenge':
+                        teammate.goal_weight = 10
+                    elif teammate.team.challenge.challenge_type.slug in ['jackpot','weight-watchers','jackpot-2-challenge']:
+                        teammate.goal_weight = 6
+
+                    if org:
+                        if not user.organization:
+                            user.organization = org
+                            teammate.organization = org
+                        else:
+                            teammate.organization = user.organization
+
+                        if org.name == 'Weight Watchers':
+                            teammate.ww_member = True
+
+                    if campaign:
+                        user.campaign = campaign
+
+                    if org_rel:
+                        if not user.organization_relationship:
+                            teammate.organization_relationship = org_rel
+                            user.organization_relationship = org_rel
+                        else:
+                            teammate.organization_relationship = user.organization_relationship
+
+                    if daily_step_goal and teammate.team.challenge.challenge_type.slug in ['step-challenge-2','step-challenge-3','weight-watchers-step-challenge','step-challenge-4']:
+                        teammate.individual_goal = daily_step_goal
+
+                    teammate.save()
+                    user.save()
+                else:
+                    teammate = teammate[0]
+                    # if there is an organization add it to the teammate
+                    if teammate.team.challenge.challenge_type.slug == 'team-challenge':
+                        teammate.goal_weight = 10
+                    elif teammate.team.challenge.challenge_type.slug in ['jackpot','weight-watchers','jackpot-2-challenge']:
+                        teammate.goal_weight = 6
+                    if org:
+                        if not user.organization:
+                            teammate.organization = org
+                            user.organization = org
+                        else:
+                            teammate.organization = user.organization
+
+                        if org.name == 'Weight Watchers':
+                            teammate.ww_member = True
+
+                    if campaign:
+                        user.campaign = campaign
+
+                    if org_rel:
+                        if not user.organization_relationship:
+                            teammate.organization_relationship = org_rel
+                            user.organization_relationship = org_rel
+                        else:
+                            teammate.organization_relationship = user.organization_relationship
+
+                    user.save()
+                if challenge.challenge_type.slug in ['jackpot', 'team-challenge', 'periodic-rewards', 'weight-watchers','maintain-dont-gain-challenge','million-step-challenge']:
+                    team.status = 'ic'
+                elif challenge.challenge_type.slug in ['jackpot-2-challenge','step-challenge-4']:
+                    team.status = 'cm'
+                team.save()
+                request.session['team_status'] = team.challenge.id
+
+                if org_rel_cut_field_value == 'dummy_empty':
+                    org_rel_cut_field_value = ''
+
+                if org_rel_cut_field_value:
+                   teammate.custom_field_value = org_rel_cut_field_value
+                   teammate.custom_field_name = org_rel_cut_field_name
+                   user.custom_field_name = org_rel_cut_field_name
+                   user.custom_field_value = org_rel_cut_field_value
+
+                if org_add_info_option:
+                   teammate.add_info_question = org_add_info_question
+                   teammate.add_info_option = org_add_info_option
+                   user.add_info_question = org_add_info_question
+                   user.add_info_option = org_add_info_option
+
+                user.save()
+
+                # add starting verification dates based off creation date of
+                # bmi and 10% challenge
+                if created:
+                    if challenge.challenge_type.slug in ['bmi-challenge', 'ten-percent-challenge', 'name-your-own-prize']:
+                        if challenge.challenge_type.slug == 'name-your-own-prize' and request.session.get('nyop_amount', False):
+                            pa = active_bet.prize
+                        else:
+                            pa = challenge.prize_amount
+                        teammate.prize_payout = pa
+                        teammate.starting_verification_open_date = teammate.created - datetime.timedelta(days=14)
+                        teammate.starting_verification_ending_date = teammate.created + datetime.timedelta(days=90)
+                    elif challenge.challenge_type.slug == 'team-challenge':
+                        teammate.starting_verification_open_date = challenge.starting_verification_open_date
+                        teammate.starting_verification_ending_date = challenge.starting_verification_ending_date
+
+                teammate.save()
+
+                activate_language(request)
+                language = translation.get_language()
+                if team.challenge.slug == 'GECapital-2014-loseweight':
+                    if language == 'es':
+                        email_name = "GE-challenge-join-2014-es"
+                    elif language == 'fr':
+                        email_name = "GE-challenge-join-2014-fr"
+                    else:
+                        email_name = "GE-challenge-join-2014"
+                    tasks.timeline_event(
+                        email={
+                            "to": teammate.participant.email,
+                            "name": email_name
+                        },
+                        notification={
+                            "to": teammate.participant,
+                            "name": "team-challenge-registration-date",
+                            "when": teammate.created
+                        },
+                        context={
+                            'participant': teammate.participant,
+                            'challenge': teammate.team.challenge,
+                            'teammate': teammate,
+                            'request': request
+                        }
+                    )
+
+            # make a new receipt
+            receipt_installment_number = 0
+            if pay_method == "installment":
+                receipt_installment_number = 1
+                if buy_more_time:
+                    last_receipt = Receipt.objects.filter(status='paid', teammate=teammate, pay_method='installment').order_by('-pk')
+                    if last_receipt:
+                        last_receipt = last_receipt[0]
+                        receipt_installment_number = last_receipt.installment_number + 1
+            receipt = Receipt.objects.create(
+                participant=user,
+                teammate=teammate,
+                hw_points = hw_points_use,
+                cash_amount = pay_amount,
+                amount= float(pay_amount) + float(hw_points_use),
+                pay_method=pay_method,
+                last_four=result.transaction.credit_card['last_4'],
+                card_type=result.transaction.credit_card['card_type'],
+                status='paid',
+                installment_number = receipt_installment_number
+            )
+            receipt.transaction_id = result.transaction.id
+            receipt.save()
+
+            if pay_method == "installment":
+                if challenge.challenge_type.slug == 'name-your-own-prize':
+                    if buy_more_time:
+                        teammate.end_date = teammate.end_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                        teammate.ending_verification_open_date = teammate.ending_verification_open_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                        teammate.ending_verification_ending_date = teammate.ending_verification_ending_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                        teammate.winner_annoucement_date = teammate.winner_annoucement_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                        teammate.save()
+                        subscription = Subscription.objects.filter(teammate=teammate)
+                        if subscription:
+                            subscription = subscription[0]
+                            subscription.status = 'a'
+                            subscription.installments = subscription.installments + 5
+                            subscription.last_payment_date = datetime.datetime.today()
+                            subscription.save()
+                            hwager = HwagerExtension(
+                                teammate=teammate,
+                                subscription=subscription,
+                                length=HWGAER_EXTENSION_LENGTH,
+                                amount=subscription.amount,
+                                date_of_extension=datetime.date.today()
+                            )
+                            hwager.save()
+                    elif active_bet:
+                        subscription, created = Subscription.objects.get_or_create(
+                            amount=installment_amount,
+                            teammate=teammate,
+                            installments=active_bet.length-1,
+                            status='a',
+                            participant=request.user,
+                            card=card,
+                            last_payment_date=datetime.date.today()
+                        )
+                        active_bet.teammate_id = teammate.id
+                        active_bet.save()
+                else:
+                    subscription, created = Subscription.objects.get_or_create(
+                        amount=installment_amount,
+                        installments=timeframe-1,
+                        status='a',
+                        participant=request.user,
+                        teammate=teammate,
+                        card=card,
+                        last_payment_date=datetime.date.today()
+                    )
+                subscription.save()
+                receipt.subscription = subscription
+                receipt.transaction_id = result.transaction.id
+                receipt.save()
+            else:
+                if challenge.challenge_type.slug == 'name-your-own-prize' and buy_more_time:
+                    teammate.end_date = teammate.end_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                    teammate.ending_verification_open_date = teammate.ending_verification_open_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                    teammate.ending_verification_ending_date = teammate.ending_verification_ending_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                    teammate.winner_annoucement_date = teammate.winner_annoucement_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                    teammate.save()
+
+                    hwager = HwagerExtension(
+                            teammate=teammate,
+                            length=HWGAER_EXTENSION_LENGTH,
+                            amount=active_bet.wager,
+                            date_of_extension=datetime.date.today()
+                        )
+                    hwager.save()
+
+            if challenge.challenge_type.slug in ['jackpot', 'million-step-challenge', 'maintain-dont-gain-challenge','step-challenge-2','step-challenge-3','weight-watchers-step-challenge','jackpot-2-challenge','step-challenge-4']:
+                pot_amount = (int(challenge.cost) * float(challenge.configuration_value))
+
+                chal_prop,create_prop = ChallengeProperty.objects.get_or_create(challenge=teammate.team.challenge)
+                if create_prop:
+                    chal_prop.current_pot = pot_amount
+                    chal_prop.total_lost = teammate.get_weight_lost()
+                else:
+                    chal_prop.current_pot = chal_prop.current_pot + pot_amount
+                    chal_prop.total_lost = chal_prop.total_lost + teammate.get_weight_lost()
+                chal_prop.save()
+
+            if challenge.challenge_type.slug == 'name-your-own-prize' and (request.session.get('nyop_amount', False) or buy_more_time):
+                 challenge.prize_amount = active_bet.prize
+            confirmed_details = {
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'hwid': user.healthywage_id,
+                'number': result.transaction.credit_card['last_4'],
+                'zip': postal_code,
+                'fee': challenge_cost,
+                'payment_option': pay_method,
+                'total': pay_amount,
+                'challenge': challenge,
+                'timeframe' :timeframe,
+                'organization' : org,
+                'teammate_id': teammate.id,
+                'ww_member': teammate.ww_member,
+                'buy_more_time': buy_more_time
+            }
+
+            request.session['payment_confirmation'] = confirmed_details
+        else:
+            payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="payment-unsuccessful", method="old-card")
+
+        return self.render_json_response(return_dict)
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, *args, **kwargs):
+        return super(UseCard, self).dispatch(*args, **kwargs)
+
+
+class ConfirmPaymentView(TemplateView):
+    template_name = "payments/reg_confirmation.html"
+
+    def get(self, request, *args, **kwargs):
+        # Create user_has_source flag. If it exits, then skip user source modal
+        payment_confirmation = request.session.get('payment_confirmation', None)
+        if not payment_confirmation:
+            return HttpResponseRedirect("/dashboard/")
+        teammate_id = request.session.get('payment_confirmation').get('teammate_id', None)
+        if not teammate_id:
+            return HttpResponseRedirect("/dashboard/")
+        teammate = Teammate.objects.filter(id=teammate_id)
+
+        if teammate.exists():
+            participant_id = teammate.first().participant_id
+            participant = Participant.objects.filter(id=participant_id)
+
+            if participant.first().source_option_for_participant:
+                request.user_has_source = True
+        # End user_has_source flag
+
+        context = {}
+        activate_language(request)
+        challenge_id = kwargs.get('challenge_id', None)
+        language = translation.get_language()
+        context['language'] = language
+        confirmation = request.session.get('payment_confirmation', False)
+        is_user_from_shareAsale = False
+        if confirmation:
+            self.request.session['card_holder_first_name'] = confirmation.get('first_name', False)
+            self.request.session['card_holder_last_name'] = confirmation.get('last_name', False)
+            confirmation['receipt'] = Receipt.objects.filter(participant=self.request.user).latest('created')
+
+            # BUGS-2232
+            if request.session.get('event_tracking', False):
+                confirmation['event_tracking'] = request.session.get('event_tracking', False)
+                request.session['event_tracking'] = False
+                challenge = confirmation['challenge']
+                if challenge.challenge_type.slug in settings.JACKPOT_CHALLENGES:
+                    confirmation['event_category'] = 'Jackpot Challenge Registration'
+                elif challenge.challenge_type.slug == 'team-challenge':
+                    confirmation['event_category'] = 'Team Challenge Registration'
+                elif challenge.challenge_type.slug == 'name-your-own-prize':
+                    confirmation['event_category'] = 'Healthy Wager Registration'
+                elif challenge.challenge_type.slug == 'maintain-dont-gain-challenge':
+                    confirmation['event_category'] = 'Maintain Don\'t Gain Challenge Registration'
+
+                if challenge.challenge_type.slug in ['name-your-own-prize',
+                                                     'team-challenge'] and is_user_from_shareAsale:
+                    teammate_id = confirmation['teammate_id']
+                    teammate = Teammate.objects.get(pk=teammate_id)
+                    teammate.source = 'ShareASale'
+                    teammate.save()
+            else:
+                confirmation['event_tracking'] = False
+            return self.render_to_response(confirmation)
+        return self.render_to_response(context)
+
+    def post(self, request, *args, **kwargs):
+        option_name = request.POST.get('source_option', None)
+        option = SourceOption.objects.filter(name=option_name).first()
+
+        # If user registers through organization
+        organization = request.session.get('payment_confirmation').get('organization')
+        if organization:
+            org_type = organization.org_type
+        else:
+            org_type = False
+
+        # If user skips selection, take 'Skipped' option
+        if option_name == 'Choose one' and not option:
+            option, created = SourceOption.objects.get_or_create(
+                name='Skipped',
+                slug='skipped',
+                description='User has skipped source selection', status='inactive')
+
+        # If user has organization
+        elif org_type:
+            org_type = str(org_type)
+            option, created = SourceOption.objects.get_or_create(
+                name=org_type,
+                slug=org_type.replace(' ', '_').lower(),
+                description='The type of organization',
+                status='inactive')
+
+        # Get teammate and participant and update
+        teammate_id = request.session.get('payment_confirmation').get('teammate_id')
+        teammate = Teammate.objects.filter(id=teammate_id)
+
+        if teammate.exists():
+            participant_id = teammate.first().participant_id
+            participant = Participant.objects.filter(id=participant_id).update(source_option_for_participant=option)
+            teammate = Teammate.objects.filter(id=teammate_id).update(source_option=option)
+
+        return HttpResponse('ok')
+
+
+class PaymentView(FormView):
+    template_name = "payments/reg_payment_nyop.html"
+    form_class = PaymentForm
+    success_url = '/options/choose_challenges/'
+    challenge = ""
+    hwager_html_variant = "v1"
+
+    # @property
+    # @memoize
+    def amount(self):
+        promos = get_promos_from_session(self.request)
+        challenge = get_challenge_from_session(self.request)
+        amount = get_amount_from_session(self.request)
+        buy_more_time = self.request.GET.get('extend_limit', False)
+
+        challenge_cost = 0
+        #First check if amount is in session
+        if challenge:
+            if challenge.challenge_type.slug == 'name-your-own-prize':
+                if buy_more_time:
+                    active_bet = self.request.user.nyop_teammate_active_bet()
+                    challenge_cost = (active_bet.wager*HWGAER_EXTENSION_LENGTH)
+                else:
+                    active_bet_id = self.request.session.get('nyop_bet_id',False)
+                    if active_bet_id:
+                        active_bet = NameYourOwnPrize.objects.filter(pk=active_bet_id)
+                        if active_bet:
+                            active_bet = active_bet[0]
+                            challenge_cost = (active_bet.wager*active_bet.length)
+            else:
+                challenge_cost = challenge.cost
+
+        # if promos exist, and they are price reductions
+        # then remove the amount from the challenge_cost
+        if promos:
+            for promo in promos:
+                if promo.type == "price":
+                    challenge_cost -= promo.promotion_amount
+
+        # if challenge cost ends up lower than 0, set it to zero.
+        if challenge_cost < 0:
+            challenge_cost = 0
+
+        return challenge_cost
+
+    def post_amount(self, nyop_active_bet=None):
+        promos = get_promos_from_session(self.request)
+        challenge = get_challenge_from_session(self.request)
+        amount = get_amount_from_session(self.request)
+        buy_more_time = self.request.GET.get('extend_limit', False)
+
+        challenge_cost = 0
+        #First check if amount is in session
+        if challenge:
+            if challenge.challenge_type.slug == 'name-your-own-prize':
+                if buy_more_time:
+                    active_bet = self.request.user.nyop_teammate_active_bet()
+                    challenge_cost = (active_bet.wager*HWGAER_EXTENSION_LENGTH)
+                elif nyop_active_bet:
+                    active_bet = NameYourOwnPrize.objects.filter(pk=nyop_active_bet)
+                    if active_bet:
+                        active_bet = active_bet[0]
+                        challenge_cost = (active_bet.wager*active_bet.length)
+            else:
+                challenge_cost = challenge.cost
+
+        # if promos exist, and they are price reductions
+        # then remove the amount from the challenge_cost
+        if promos:
+            for promo in promos:
+                if promo.type == "price":
+                    challenge_cost -= promo.promotion_amount
+
+        # if challenge cost ends up lower than 0, set it to zero.
+        if challenge_cost < 0:
+            challenge_cost = 0
+
+        return challenge_cost
+
+    def get_form(self, form_class):
+        payment_form = form_class(
+            self.request.POST or None,
+            self.request.FILES or None,
+            request=self.request,
+            amount=self.amount()
+        )
+        return payment_form
+
+    def hw_point_calculation(self, fee, chal_amount):
+        hw_points = self.request.user.user_hw_point_balance()
+        remaining_balance = chal_amount - hw_points
+        remaining_hw_point = abs(remaining_balance) if remaining_balance < 0 else 0
+        hw_points_use = chal_amount if remaining_hw_point else hw_points
+        chal_amount = chal_amount - hw_points
+        chal_amount = abs(chal_amount) if chal_amount >= 0 else 0
+        return hw_points, remaining_balance, chal_amount, remaining_hw_point, hw_points_use
+
+    def is_test_card(self, cc_num=False, cvv=False, exp_month=False, exp_year=False):
+        if cc_num and cvv and exp_month and exp_year:
+            if cc_num == "9988776655443322" and cvv == "750" and exp_year == "2030" and exp_month == "12":
+                return True
+        return False
+
+    def post(self, request, *args, **kwargs):
+        activate_language(request)
+        if request.user.is_authenticated():
+            #User must be authenticated to proceed
+            user = request.user
+        else:
+            # Redirect to home page if user is not authenticated
+            return HttpResponseRedirect("/")
+
+        if 'challenge_to_pay' in request.session:
+            challenge = Challenge.objects.get(id=request.session['challenge_to_pay'])
+        else:
+            challenge = get_challenge_from_session(self.request)
+
+        payment_request = True
+        daily_step_goal = request.session.get('daily_step_goal', False)
+        active_bet_id = request.POST.get('active_bet', None)
+        buy_more_time = self.request.GET.get('extend_limit', False)
+        nyop_active_bet = active_bet_id
+        if challenge and challenge.challenge_type.slug == 'name-your-own-prize':
+            teammate = Teammate.objects.filter(participant=user, team__challenge__challenge_type__slug = 'name-your-own-prize', status__in=["ac", "cm", "de", "rp", "tt"])
+            if user.is_user_in_nyop_challenge() and not buy_more_time:
+                return HttpResponseRedirect("/dashboard/")
+            elif teammate and not buy_more_time:
+                return HttpResponseRedirect("/dashboard/")
+        elif not challenge:
+            return HttpResponseRedirect("/dashboard/")
+
+        if buy_more_time:
+            teammate = Teammate.objects.filter(participant=user, team__challenge__challenge_type__slug = 'name-your-own-prize', status__in=["ac", "cm", "de", "rp", "tt"])
+            if teammate:
+                teammate = teammate[0]
+                team = teammate.team
+            else:
+                return HttpResponseRedirect("/challenge/directory")
+
+        first_name = request.POST.get('first_name', None)
+        last_name = request.POST.get('last_name', None)
+        expiration_month = request.POST.get('expiration_month', None)
+        expiration_year = request.POST.get('expiration_year', None)
+        cc_num = request.POST.get('number', None)
+        cvv = request.POST.get('cvv', None)
+        postal_code = request.POST.get('postal_code', None)
+        amount = request.POST.get('amount', '0')
+        payment_type = request.POST.get('optionsRadios', 'single')
+        synchronizer_token = request.POST.get('synchronizer_token', None)
+
+        promos = get_promos_from_session(request)
+
+        # pull org if it exists (this will be applied to the
+        # specific teammate object)
+        org = request.session.get('tmp_reg_employer', False)
+        org_rel = request.session.get('tmp_reg_employer_relationship', False)
+        alternate_email_address = request.session.get('tmp_reg_alternate_email_address', False)
+        org_rel_cut_field_value =  request.session.get('tmp_reg_custom_field_name',False)
+        org_rel_cut_field_name = request.session.get('tmp_reg_custom_field_label',False)
+        org_add_info_question = request.session.get('tmp_reg_employer_infoquestion',False)
+        org_add_info_option = request.session.get('tmp_reg_employer_infooption',False)
+        campaign = request.session.get('tmp_reg_campaign', False)
+
+        save_card = request.POST.get('save_this_card', 'off')
+        save = False
+        if save_card == 'on':
+            save = True
+
+        test_credit_card = self.is_test_card(cc_num,cvv,expiration_month,expiration_year)
+        if test_credit_card:
+            payment_type = 'single'
+            save = False
+
+        amount_to_charge = self.post_amount(nyop_active_bet)
+        if challenge.challenge_type.slug == 'name-your-own-prize':
+            fee = amount_to_charge
+        else:
+            fee = challenge.cost
+        amount_to_charge = self.post_amount(nyop_active_bet)
+        hw_points, remaining_balance, amount_to_charge, remaining_hw_point, hw_points_use = self.hw_point_calculation(fee, amount_to_charge)
+
+        form_class = self.get_form_class()
+        form = self.get_form(form_class)
+        timeframe = 3
+        if form.is_valid() or Decimal(self.post_amount(nyop_active_bet)) == 0 or  Decimal(amount_to_charge) == 0:
+            challenge = get_challenge_from_session(request)
+            if buy_more_time:
+                active_bet = self.request.user.nyop_teammate_active_bet()
+            elif request.session.get('nyop_amount', False):
+                if active_bet_id:
+                    active_bet = NameYourOwnPrize.objects.filter(pk=active_bet_id,participant=user)
+                    if active_bet:
+                        active_bet = active_bet[0]
+                        goal_percentage = convert_goal_to_percentage(active_bet.goal, active_bet.weight_in_lbs)
+                        height_feet = int(active_bet.height_inches_total/12)
+                        height_inches = int(active_bet.height_inches_total%12)
+                        bmi = calculate_bmi(height_feet, height_inches, float(active_bet.weight_in_lbs))
+                        prize = calculate_nyop_prize(active_bet.gender, bmi, float(goal_percentage), int(active_bet.wager), int(active_bet.length), float(active_bet.goal), active_bet.height_inches_total, active_bet.waist, active_bet.weight_in_lbs)
+                        active_bet.prize = prize
+                        active_bet.prize_boost = get_prize_boost_from_last_visited_landing_page(request)
+                        active_bet.save()
+                    else:
+                        return HttpResponseRedirect("/weight-loss-bet/prize/")
+            if challenge:
+                if challenge.challenge_type.slug == 'name-your-own-prize' and not request.session.get('nyop_amount', False) and not buy_more_time:
+                    return HttpResponseRedirect(reverse('registration_register'))
+                user_created = False
+                if challenge.challenge_type.slug == 'team-challenge':
+                    # set check for team formation
+                    request.session['team_formation'] = True
+
+                elif challenge.challenge_type.slug in ['jackpot', 'million-step-challenge','maintain-dont-gain-challenge','step-challenge-2','step-challenge-3','weight-watchers-step-challenge','jackpot-2-challenge','step-challenge-4']:
+                    # set check for team formation
+                    request.session['team_formation_jackpot'] = True
+                    request.session['session_challenge'] = challenge
+
+
+                user_results = None
+                if form.is_valid() and not test_credit_card:
+                    user_result = braintree.Customer.create({
+                        "first_name": form.cleaned_data['first_name'],
+                        "last_name": form.cleaned_data['last_name'],
+                        "id": user.pk,
+                    })
+
+                #create amounts to send to braintree
+                if payment_type == "single":
+                    # lump sum payment
+                    pay_amount = Decimal(amount_to_charge)
+                else:
+                    challenge_installment = challenge.installment
+                    if challenge.challenge_type.slug == 'name-your-own-prize':
+                        try:
+                            if active_bet:
+                                if buy_more_time:
+                                    timeframe = HWGAER_EXTENSION_LENGTH
+                                else:
+                                    timeframe = active_bet.length
+                                installment_amount, odd_payment = process_installment_amounts(float(amount_to_charge), timeframe)
+                                if odd_payment:
+                                    pay_amount = u"%s" % ("{0:.2f}".format(odd_payment))
+                                else:
+                                    pay_amount = u"%s" % ("{0:.2f}".format(installment_amount))
+                        except:
+                            return HttpResponseRedirect(reverse('registration_register'))
+                    else:
+                        if not challenge_installment == 0:
+                            timeframe = challenge_installment
+                            installment_amount, odd_payment = process_installment_amounts(float(amount_to_charge), challenge_installment)
+
+                        if odd_payment:
+                            pay_amount = u"%s" % ("{0:.2f}".format(odd_payment))
+                        else:
+                            pay_amount = u"%s" % ("{0:.2f}".format(installment_amount))
+                    save = True
+
+                # make a transaction to setup the user in the braintree system
+                if save:
+                    transaction_details = {
+                        "amount": pay_amount,
+                        "customer_id": user.pk,
+                        "credit_card": {
+                            "number": cc_num,
+                            "expiration_month": expiration_month,
+                            "expiration_year": expiration_year,
+                            "cvv": cvv,
+                            "cardholder_name": first_name + ' ' + last_name,
+                        },
+                        "options": {
+                            "store_in_vault": True,
+                            "submit_for_settlement": True,
+                        }
+                    }
+                else:
+                    transaction_details = {
+                        "amount": pay_amount,
+                        "customer_id": user.pk,
+                        "credit_card": {
+                            "number": cc_num,
+                            "expiration_month": expiration_month,
+                            "expiration_year": expiration_year,
+                            "cvv": cvv,
+                            "cardholder_name": first_name + ' ' + last_name,
+                        },
+                        "options": {
+                            "submit_for_settlement": True,
+                        }
+                    }
+
+                result = False
+                payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="before-braintree-call", method="new-card")
+                if request.session.get('tmp_reg_challenges', False) or buy_more_time:
+                    if request.session.get('synchronizer_token', False):
+                        del request.session['synchronizer_token']
+                        if payment_request:
+                            payment_request = False
+                            if not test_credit_card:
+                                result = braintree.Transaction.sale(transaction_details)
+                            if result and result.is_success or test_credit_card:
+                                del request.session['tmp_reg_challenges']
+
+                if result and result.is_success or Decimal(pay_amount) < 0.01 or test_credit_card:
+                    payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="payment-successful", method="new-card")
+                    request.session['event_tracking'] = True
+                    # check if a pay amount or not
+                    free = False
+                    if Decimal(pay_amount) < 0.01 or test_credit_card:
+                        free = True
+
+                    if Site._meta.installed:
+                        site = Site.objects.get_current()
+                    else:
+                        site = RequestSite(request)
+                    if alternate_email_address:
+                        existing_email = user.email
+                        user.email = alternate_email_address
+                        user.alternate_email_address = existing_email
+                        user.save()
+                    if site:
+                        #DEV-961
+                        if not user.email_confirmed:
+                            # send base registration email to user
+                            try:
+                                rp = RegistrationProfile.objects.get(user=user)
+                                if rp:
+                                    tasks.task_timeline_event(
+                                        email={
+                                            "to": user.email,
+                                            "name": "email-515",
+                                        },
+                                        notification=None,
+                                        context={
+                                            'participant': user.id,
+                                            'activation_key': rp.activation_key,
+                                            'expiration_days': settings.ACCOUNT_ACTIVATION_DAYS,
+                                            'site': site.domain,
+                                            'request': ''
+                                        }
+                                    )
+                            except:
+                                pass
+
+                        elif challenge.challenge_type.slug != "name-your-own-prize" and not user.email_confirm_sent and not user.email_confirmed:
+                            try:
+                                rp = user.registrationprofile_set.all()[0]
+                                tasks.task_timeline_event(
+                                    email={
+                                        "to": user.email,
+                                        "name": "HealthyWager-Verification",
+                                    },
+                                    notification=None,
+                                    context={
+                                        'participant': user.id,
+                                        'activation_key': rp.activation_key,
+                                        'expiration_days': settings.ACCOUNT_ACTIVATION_DAYS,
+                                        'site': site.domain,
+                                        'request': ''
+                                    }
+                                )
+                            except:
+                                pass
+
+                    if not buy_more_time:
+                        if user.first_name and user.last_name:
+                            team_name = user.get_short_name().replace(".", "").replace(". ", "").replace(" .", "") + "'s Fantastic Team"
+                        else:
+                            team_name = user.email
+
+                        if challenge.challenge_type.slug == "bmi-challenge" and request.session.get('upgrade', False):
+                            # if upgrade from a bmi challenge, get rid of the old challenge and teammate
+                            try:
+                                team = Team.objects.get(
+                                    creator=user,
+                                    challenge__challenge_type__slug='bmi-challenge'
+                                )
+                            except:
+                                pass
+                            else:
+                                team.delete()
+
+                        if challenge.challenge_type.slug == 'name-your-own-prize' and request.session.get('nyop_amount', False):
+                            if active_bet:
+                                if request.session.get('repeaters', False) or request.session.get('tmp_reg_campaign', False) == 'pandora' or request.session.get('slickdeals', False) or request.session.get('100_offer_lp', False):
+                                    active_bet.prize += 100
+                                elif request.session.get('msmom', False) or request.session.get('abc_13', False) or request.session.get('coupon_mom_lp', False) or request.session.get('1_sale', False) or request.session.get('reddit', False):
+                                    active_bet.prize += 50
+                                elif request.session.get('v_day', False) or request.session.get('st_patty', False):
+                                    active_bet.prize += 30
+                                elif request.session.get('new_experimenter', False) or request.session.get('exclusive40', False):
+                                    active_bet.prize += 40
+                                active_bet.is_active = True
+                                active_bet.save()
+                            team = Team.objects.create(
+                                creator=user,
+                                challenge=challenge,
+                            )
+                            created = True
+                        else:
+                            if not Team.objects.filter(creator=user, challenge=challenge).exists():
+                                team, created = Team.objects.get_or_create(
+                                    creator=user,
+                                    challenge=challenge,
+                                )
+                            else:
+                                created = False
+
+                        if created:
+                            if challenge.challenge_type.slug in ['step-challenge-2','step-challenge-3','weight-watchers-step-challenge','step-challenge-4']:
+                                team.team_step_goal = team.team_goal()
+                            team.name = team_name
+                            team.save()
+
+                        # make a teammate object to serve as captain
+                        teammate = Teammate.objects.filter(team=team,participant=user,captain=True, status__in=["ac", "cm", "tt"])
+                        if not teammate:
+                            request.session['initial_overlay_status'] = challenge.id
+                            teammate = Teammate(request=request)
+                            teammate.team=team
+                            teammate.participant=user
+                            teammate.captain=True
+                            if 'tmp_reg_employer_relationship' in request.session.keys():
+                                if request.session['tmp_reg_employer_relationship'] == 'cheerleader':
+                                    teammate.teammate_type = 'chr'
+                            # if there is an organization add it to the teammate
+                            if teammate.team.challenge.challenge_type.slug == 'team-challenge':
+                                teammate.goal_weight = 10
+                            elif teammate.team.challenge.challenge_type.slug in ['jackpot','weight-watchers','jackpot-2-challenge']:
+                                teammate.goal_weight = 6
+
+                            if daily_step_goal and teammate.team.challenge.challenge_type.slug in ['step-challenge-2','step-challenge-3','weight-watchers-step-challenge','step-challenge-4']:
+                                teammate.individual_goal = daily_step_goal
+
+                            if org:
+                                if not user.organization:
+                                    teammate.organization = org
+                                    user.organization = org
+                                else:
+                                    teammate.organization = user.organization
+
+                                if org.name == 'Weight Watchers':
+                                    teammate.ww_member = True
+
+                            if campaign:
+                                user.campaign = campaign
+
+                            if org_rel:
+                                if not user.organization_relationship:
+                                    teammate.organization_relationship = org_rel
+                                    user.organization_relationship = org_rel
+                                else:
+                                    teammate.organization_relationship = user.organization_relationship
+                            teammate.save()
+                            user.save()
+                        else:
+                            teammate = teammate[0]
+                            if teammate.team.challenge.challenge_type.slug == 'team-challenge':
+                                teammate.goal_weight = 10
+                            elif teammate.team.challenge.challenge_type.slug in ['jackpot','weight-watchers','jackpot-2-challenge']:
+                                teammate.goal_weight = 6
+                            if org:
+                                if not user.organization:
+                                    teammate.organization = org
+                                    user.organization = org
+                                else:
+                                    teammate.organization = user.organization
+
+                                if org.name == 'Weight Watchers':
+                                    teammate.ww_member = True
+
+                            if campaign:
+                                user.campaign = campaign
+
+                        if org_rel:
+                            if not user.organization_relationship:
+                                teammate.organization_relationship = org_rel
+                                user.organization_relationship = org_rel
+                            else:
+                                teammate.organization_relationship = user.organization_relationship
+
+                        if test_credit_card:
+                            teammate.status = "tt"
+                        teammate.save()
+                        user.save()
+
+                        if challenge.challenge_type.slug  in ['jackpot', 'team-challenge', 'periodic-rewards', 'weight-watchers','maintain-dont-gain-challenge','million-step-challenge','step-challenge-2','step-challenge-3','weight-watchers-step-challenge']:
+                            team.status = 'ic'
+                        elif challenge.challenge_type.slug in ['jackpot-2-challenge','step-challenge-4']:
+                            team.status = 'cm'
+                        team.save()
+
+                        if org_rel_cut_field_value == 'dummy_empty':
+                            org_rel_cut_field_value = ''
+
+                        if org_rel_cut_field_value:
+                            teammate.custom_field_value = org_rel_cut_field_value
+                            teammate.custom_field_name = org_rel_cut_field_name
+                            user.custom_field_value = org_rel_cut_field_value
+                            user.custom_field_name = org_rel_cut_field_name
+
+                        if org_add_info_option:
+                           teammate.add_info_question = org_add_info_question
+                           teammate.add_info_option = org_add_info_option
+                           user.add_info_question = org_add_info_question
+                           user.add_info_option = org_add_info_option
+
+                        user.save()
+
+                        if created:
+                            # add starting verification dates based off creation date of
+                            # bmi and 10% challenge and NYOP
+                            if challenge.challenge_type.slug in ['bmi-challenge', 'ten-percent-challenge', 'name-your-own-prize']:
+                                if challenge.challenge_type.slug == 'name-your-own-prize' and request.session.get('nyop_amount', False):
+                                    pa = active_bet.prize
+                                else:
+                                    pa = challenge.prize_amount
+                                teammate.prize_payout = pa
+                                teammate.starting_verification_open_date = teammate.created - datetime.timedelta(days=14)
+                                teammate.starting_verification_ending_date = teammate.created + datetime.timedelta(days=90)
+                            elif challenge.challenge_type.slug == 'team-challenge':
+                                teammate.starting_verification_open_date = challenge.starting_verification_open_date
+                                teammate.starting_verification_ending_date = challenge.starting_verification_ending_date
+
+                        teammate.save()
+
+                        activate_language(request)
+                        language = translation.get_language()
+                        if team.challenge.slug == 'GECapital-2014-loseweight':
+                            if language == 'es':
+                                email_name = "GE-challenge-join-2014-es"
+                            elif language == 'fr':
+                                email_name = "GE-challenge-join-2014-fr"
+                            else:
+                                email_name = "GE-challenge-join-2014"
+                            tasks.timeline_event(
+                                email={
+                                    "to": teammate.participant.email,
+                                    "name": email_name
+                                },
+                                notification={
+                                    "to": teammate.participant,
+                                    "name": "team-challenge-registration-date",
+                                    "when": teammate.created
+                                },
+                                context={
+                                    'participant': teammate.participant,
+                                    'challenge': teammate.team.challenge,
+                                    'teammate': teammate,
+                                    'request': request
+                                }
+                            )
+
+                        if challenge.challenge_type.slug == 'name-your-own-prize' and request.session.get('nyop_amount', False):
+                            if active_bet:
+                                active_bet.teammate_id = teammate.id
+                                active_bet.save()
+                        if promos:
+                            for promo in promos:
+                                # add the teammate to a PromotionUsage instance
+                                usage = PromotionUsage.objects.create(
+                                    teammate=teammate,
+                                    promotion=promo,
+                                )
+
+                    # make a new receipt
+                    receipt_installment_number = 0
+                    if payment_type == "installment":
+                        receipt_installment_number = 1
+                        if buy_more_time:
+                            last_receipt = Receipt.objects.filter(status='paid', teammate=teammate, pay_method='installment').order_by('-pk')
+                            if last_receipt:
+                                last_receipt = last_receipt[0]
+                                receipt_installment_number = last_receipt.installment_number + 1
+                    receipt = Receipt.objects.create(
+                        participant=user,
+                        teammate=teammate,
+                        hw_points = hw_points_use,
+                        cash_amount = transaction_details['amount'],
+                        amount=float(transaction_details['amount']) + float(hw_points_use),
+                        pay_method=payment_type,
+                        installment_number = receipt_installment_number
+                    )
+                    if not free:
+                        receipt.last_four = result.transaction.credit_card['last_4']
+                        receipt.card_type = result.transaction.credit_card['card_type']
+                        receipt.transaction_id = result.transaction.id
+                    if receipt.cash_amount == 0 and receipt.hw_points != 0:
+                        receipt.transaction_id = "PTS"
+
+                    if test_credit_card:
+                        receipt.status = "test"
+                    receipt.save()
+
+                    if challenge.challenge_type.slug == 'name-your-own-prize' and (request.session.get('nyop_amount', False) or buy_more_time):
+                        challenge.prize_amount = active_bet.prize
+                    confirmed_details = {
+                        'hwid': user.healthywage_id,
+                        'challenge': challenge,
+                        'fee': amount_to_charge,
+                        'payment_option': payment_type,
+                        'total': pay_amount,
+                        'challenge': challenge,
+                        'timeframe': timeframe,
+                        'organization': org,
+                        'organization_str': str(org),
+                        'teammate_id': teammate.id,
+                        'ww_member': teammate.ww_member,
+                        'buy_more_time': buy_more_time
+                    }
+
+                    if not free:
+                        # extra details for paid
+                        confirmed_details['first_name'] = first_name
+                        confirmed_details['last_name'] = last_name
+                        confirmed_details['number'] = result.transaction.credit_card['last_4']
+                        confirmed_details['zip'] = postal_code
+                        confirmed_details['organization'] = org
+
+                    request.session['payment_confirmation'] = confirmed_details
+
+                    if save:
+                        credit_card, created = CreditCard.objects.get_or_create(
+                            participant=self.request.user,
+                            token=result.transaction.credit_card['token'],
+                            last_four=result.transaction.credit_card['last_4'],
+                            type=result.transaction.credit_card['card_type'],
+                            cardholder=result.transaction.credit_card['cardholder_name'],
+                            postal_code=postal_code,
+                            expiration_month=result.transaction.credit_card['expiration_month'],
+                            expiration_year=result.transaction.credit_card['expiration_year']
+                        )
+
+                    if payment_type == "installment":
+                        # if we are doing installments save the card to the
+                        # subscription object
+                        if challenge.challenge_type.slug == 'name-your-own-prize':
+                            if buy_more_time:
+                                teammate.end_date = teammate.end_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.ending_verification_open_date = teammate.ending_verification_open_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.ending_verification_ending_date = teammate.ending_verification_ending_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.winner_annoucement_date = teammate.winner_annoucement_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.save()
+                                subscription = Subscription.objects.filter(teammate=teammate)
+                                if subscription:
+                                    subscription = subscription[0]
+                                    subscription.status = 'a'
+                                    subscription.installments = subscription.installments + (HWGAER_EXTENSION_LENGTH-1)
+                                    subscription.last_payment_date = datetime.datetime.today()
+                                    subscription.save()
+                                else:
+                                    subscription, created = Subscription.objects.get_or_create(
+                                    amount=installment_amount,
+                                    teammate=teammate,
+                                    installments=(HWGAER_EXTENSION_LENGTH-1),
+                                    status='a',
+                                    participant=request.user,
+                                    card=credit_card,
+                                    last_payment_date=datetime.date.today()
+                                )
+                                hwager = HwagerExtension(
+                                    teammate=teammate,
+                                    subscription=subscription,
+                                    length=HWGAER_EXTENSION_LENGTH,
+                                    amount=subscription.amount,
+                                    date_of_extension=datetime.date.today()
+                                )
+                                hwager.save()
+                            else:
+                                subscription, created = Subscription.objects.get_or_create(
+                                    amount=installment_amount,
+                                    teammate=teammate,
+                                    installments=active_bet.length-1,
+                                    status='a',
+                                    participant=request.user,
+                                    card=credit_card,
+                                    last_payment_date=datetime.date.today()
+                                )
+                        else:
+                            subscription, created = Subscription.objects.get_or_create(
+                                amount=installment_amount,
+                                teammate=teammate,
+                                installments=timeframe-1,
+                                status='a',
+                                participant=request.user,
+                                card=credit_card,
+                                last_payment_date=datetime.date.today()
+                            )
+
+                        receipt.subscription = subscription
+                        receipt.save()
+                    else:
+                        if challenge.challenge_type.slug == 'name-your-own-prize':
+                            if buy_more_time:
+                                teammate.end_date = teammate.end_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.ending_verification_open_date = teammate.ending_verification_open_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.ending_verification_ending_date = teammate.ending_verification_ending_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.winner_annoucement_date = teammate.winner_annoucement_date + relativedelta(months=HWGAER_EXTENSION_LENGTH)
+                                teammate.save()
+
+                                hwager = HwagerExtension(
+                                        teammate=teammate,
+                                        length=HWGAER_EXTENSION_LENGTH,
+                                        amount=active_bet.wager,
+                                        date_of_extension=datetime.date.today()
+                                    )
+                                hwager.save()
+
+                    # DEV - 1041 Update referral System
+                    unique_id = request.session.get('unique_id', False)
+                    referral = request.session.get('ref_active_hw_id', False)
+                    Cid = request.session.get('ref_active_Cid', False)
+                    method = request.session.get('ref_active_social_method',False)
+                    referral_url = request.session.get('referral_url',False)
+
+                    if unique_id:
+                        cha_id = Challenge.objects.get(id=Cid)
+                        value = cha_id.referral_amount
+                        participant = Participant.objects.get(email=user.email)
+                        receipt_record = Receipt.objects.filter(participant_id=participant.id)
+
+                    if unique_id:
+                        obj = Referral.objects.filter(referrer=Participant.objects.get(healthywage_id=referral),referred_email=user.email,status='a',challenge_id=Cid,)
+                        referrer=Participant.objects.get(healthywage_id=referral)
+                        if receipt_record and not obj and referrer.email != user.email:
+                            if (challenge.cost > 0 or challenge.challenge_type.slug == 'name-your-own-prize') and Cid == challenge.id:
+                                try:
+                                    refs = Referral.objects.filter(
+                                        referred_email=user.email,
+                                        unique_id=unique_id,
+                                        status='p',
+                                        challenge_id=Cid,
+                                    ).latest('created')
+                                    if challenge.challenge_type.slug == 'name-your-own-prize':
+                                        try:
+                                            create_ledger = False
+                                            winner = False
+                                            nyop_winner = False
+                                            teammates = Teammate.objects.filter(participant=refs.referrer,team__challenge__challenge_type__slug='name-your-own-prize',status__in=['tt','cm','de','ac','wi'])
+                                            referrer_teammate = teammates.exclude(status='wi').order_by('-created')
+                                            winner_teammate = teammates.filter(status='wi').order_by('-created')
+                                            winners = Winner.objects.filter(participant=refs.referrer,challenge__challenge_type__slug='name-your-own-prize')
+                                            if winner_teammate:
+                                                nyop_winner = winners.filter(teammate=winner_teammate[0]).order_by('-created')
+                                            if referrer_teammate:
+                                                winner = winners.filter(teammate=referrer_teammate[0]).order_by('-created')
+                                                create_ledger = refs.created < referrer_teammate[0].created
+
+                                            if (referrer_teammate or (winner and winner[0].status in ["possible", "pending","payable"])) and not create_ledger:
+                                                refs.status = 'a'
+                                                refs.save()
+                                                if winner:
+                                                    winner = winner[0]
+                                                    winner.prize_amount_override = referrer_teammate[0].total_payout_for_hwager()
+                                                    winner.save()
+
+                                            elif (nyop_winner and nyop_winner[0].status == 'paid') or (create_ledger and nyop_winner and nyop_winner[0].status == 'paid'):
+                                                refs.status = 'a'
+                                                Ledger().create_ledger_record(refs.referrer, 0, refs.value, 'pm', 'ra',refs.id, status='vb')
+                                            else:
+                                                refs.status = 'l'
+                                        except:
+                                            refs.status = 'l'
+                                    else:
+                                        refs.status = 'a'
+                                    refs.save()
+                                    referrer_person = refs.referrer
+                                except Referral.DoesNotExist:
+                                    referral = Referral(
+                                        referrer=Participant.objects.get(healthywage_id=referral),
+                                        challenge=cha_id,
+                                        value=value,
+                                        referred_email=user.email,
+                                        referred_name=user.get_full_name(),
+                                        medium=method,
+                                        unique_id=unique_id
+                                    )
+                                    referral.save()
+                                    referrer_person = referral.referrer
+                                    if challenge.challenge_type.slug == 'name-your-own-prize':
+                                        try:
+                                            winner = False
+                                            nyop_winner = False
+                                            teammates = Teammate.objects.filter(participant=referrer_person, team__challenge__challenge_type__slug='name-your-own-prize',status__in=['tt','cm','de','ac','wi'])
+                                            referrer_teammate = teammates.exclude(status='wi').order_by('-created')
+                                            winner_teammate = teammates.filter(status='wi').order_by('-created')
+                                            winners = Winner.objects.filter(participant=referral.referrer,challenge__challenge_type__slug='name-your-own-prize')
+                                            if referrer_teammate:
+                                                winner = winners.filter(teammate=referrer_teammate[0]).order_by('-created')
+                                            if winner_teammate:
+                                                nyop_winner = winners.filter(teammate=winner_teammate[0]).order_by('-created')
+
+                                            if referrer_teammate or (winner and winner[0].status in ["possible", "pending", "payable"]):
+                                                referral.status = 'a'
+                                                referral.save()
+                                                if winner:
+                                                    winner = winner[0]
+                                                    winner.prize_amount_override = referrer_teammate[0].total_payout_for_hwager()
+                                                    winner.save()
+                                            elif nyop_winner and nyop_winner[0].status == 'paid':
+                                                referral.status = 'a'
+                                                Ledger().create_ledger_record(referral.referrer, 0, referral.value,'pm', 'ra', referral.id, status='vb')
+                                            else:
+                                                referral.status = 'l'
+
+                                        except:
+                                            referral.status = 'l'
+                                    else:
+                                        referral.status = 'a'
+                                    referral.save()
+                                    # DEV - 1123
+                                referrer_teammate = Teammate.objects.filter(participant = referrer_person, team__challenge=Cid)
+                                referrer_team = Teammate.objects.filter(participant = referrer_person, team__challenge=Cid)
+                                if referrer_team:
+                                    referrer_team = referrer_team[0].team
+
+                                if referrer_teammate:
+                                    referrer_teammate = referrer_teammate[0]
+
+                                if referrer_team and referrer_teammate:
+                                    if challenge.challenge_type.slug == 'name-your-own-prize' or challenge.challenge_type.slug != 'name-your-own-prize':
+                                        if cha_id.challenge_type.slug == 'name-your-own-prize':
+                                            referrals = Referral.objects.filter(referrer=referrer_person,status='a',challenge = referrer_team.challenge)
+                                            referred_amount = cha_id.referred_amount
+                                            if referrals:
+                                                tasks.task_timeline_event(
+                                                    email={
+                                                        "to": referrer_person.email,
+                                                        "name": "email-347",
+                                                    },
+                                                    notification=None,
+                                                    context={
+                                                        'referred_email': user.email,
+                                                        'participant': user.id,
+                                                        'referrer_name': referrer_person.get_first_name(),
+                                                        'referrer_team':referrer_team.id,
+                                                        'referral_url':referral_url,
+                                                        'referral_bonus':value,
+                                                        'request': '',
+                                                        'teammate': referrer_teammate.id,
+                                                        'referred_amount': referred_amount,
+                                                    }
+                                                )
+                                                print "Email email-347 sent to : " + str(referrer_teammate.participant.email)
+                                        elif cha_id.challenge_type.slug == 'team-challenge':
+                                            tasks.task_timeline_event(
+                                                email={
+                                                    "to": referrer_person.email,
+                                                    "name": "TC Referral Confirmation Email",
+                                                },
+                                                notification=None,
+                                                context={
+                                                    'referred_email': user.email,
+                                                    'participant': user.id,
+                                                    'referrer_name': referrer_person.get_first_name(),
+                                                    'referrer_team':referrer_team.id,
+                                                    'referral_url':referral_url,
+                                                    'challenge':referrer_team.challenge.id,
+                                                    'request': '',
+                                                    'teammate': referrer_teammate.id
+                                                }
+                                            )
+                                        elif cha_id.challenge_type.slug =='weight-watchers' or cha_id.challenge_type.slug in settings.JACKPOT_CHALLENGES:
+                                            if cha_id.challenge_type.slug == 'weight-watchers':
+                                                jackpot_referral = "Jackpot Referral Confirmation Email-ww"
+                                            elif cha_id.challenge_type.slug == 'jackpot-2-challenge':
+                                                jackpot_referral = "email-759"
+                                            else:
+                                                jackpot_referral = "Jackpot Referral Confirmation Email"
+                                            tasks.task_timeline_event(
+                                                email={
+                                                    "to": referrer_person.email,
+                                                    "name": jackpot_referral,
+                                                },
+                                                notification=None,
+                                                context={
+                                                    'referred_email': user.email,
+                                                    'participant': user.id,
+                                                    'referrer_name': referrer_person.get_first_name(),
+                                                    'referrer_team':referrer_team.id,
+                                                    'referral_url':referral_url,
+                                                    'request': '',
+                                                    'teammate': referrer_teammate.id
+                                                }
+                                            )
+                    if challenge.challenge_type.slug == 'team-challenge':
+                        # set check for team formation
+                        request.session['team_formation'] = True
+
+                    elif challenge.challenge_type.slug in ['jackpot', 'million-step-challenge', 'maintain-dont-gain-challenge','step-challenge-2','step-challenge-3','weight-watchers-step-challenge','jackpot-2-challenge','step-challenge-4']:
+                        # set check for team formation
+                        request.session['team_formation_jackpot'] = True
+                        request.session['session_challenge'] = challenge
+
+                        pot_amount = (int(challenge.cost) * float(challenge.configuration_value))
+                        chal_prop,create_prop = ChallengeProperty.objects.get_or_create(challenge=teammate.team.challenge)
+                        if create_prop:
+                            chal_prop.current_pot = pot_amount
+                            chal_prop.total_lost = teammate.get_weight_lost()
+                        else:
+                            chal_prop.current_pot = chal_prop.current_pot + pot_amount
+                            chal_prop.total_lost = chal_prop.total_lost + teammate.get_weight_lost()
+                        chal_prop.save()
+
+                    if request.session.get('tmp_reg_challenges', False):
+                        del request.session['tmp_reg_challenges']
+
+                    RegisterUserView().clear_session(request)
+                    return redirect("/payments/confirm/" + str(challenge.id))
+                else:
+                    payment_request_log = PaymentRequestLog.objects.create(user=user.id, challenge=challenge.id, status="payment-unsuccessful", method="new-card")
+                    # if return is a failure find the fields responsible
+                    from django.forms.forms import NON_FIELD_ERRORS
+                    from django.forms.util import ErrorList
+                    errors = form._errors.setdefault(NON_FIELD_ERRORS, ErrorList())
+                    errors.append(_('Card could not be processed. Please make sure you have entered the numbers (including CVV) correctly or call your bank for additional details'))
+
+        payment_extras_form = PaymentExtrasForm(request.GET, request=self.request)
+        kwargs['payment_extras_form'] = payment_extras_form
+
+        return self.render_to_response(
+            self.get_context_data(
+                form=form,
+                payment_extras_form=payment_extras_form
+            )
+        )
+
+    def get(self, request, *args, **kwargs):
+        org = request.session.get('tmp_reg_employer', False)
+        org_rel = request.session.get('tmp_reg_employer_relationship', False)
+        user = request.user
+        if not user.is_authenticated():
+            return HttpResponseRedirect("/")
+
+        if not org and user.organization:
+            request.session['tmp_reg_employer'] = user.organization
+            org = user.organization
+        if not org_rel and user.organization_relationship:
+            self.request.session['tmp_reg_employer_relationship'] = user.organization_relationship
+            org_rel = user.organization_relationship
+
+        context = self.get_context_data(**kwargs)
+        context['hwager_variant'] = self.hwager_html_variant
+        activate_language(request)
+        language = translation.get_language()
+        context['language'] = language
+        ar_lang_list = ["ar", "ar-dz", "ar-bh", "ar-eg", "ar-iq", "ar-jo", "ar-kw", "ar-lb", "ar-ly", "ar-ma", "ar-om", "ar-qa", "ar-sa", "ar-sy", "ar-tn", "ar-ae", "ar-ye"]
+        fr_lang_list = ["fr", "fr-be" , "fr-ca" , "fr-fr" , "fr-lu", "fr-mc", "fr-ch"]
+        es_lang_list = ["es", "es-ar", "es-bo", "es-cl", "es-co", "es-cr", "es-do", "es-ec", "es-sv","es-gt", "es-hn", "es-mx", "es-ni", "es-pa", "es-py", "es-pe", "es-pr", "es-es", "es-uy", "es-ve"]
+        context['ar_lang_list'] = ar_lang_list
+        context ['fr_lang_list'] = fr_lang_list
+        context ['es_lang_list'] = es_lang_list
+        #User must be authenticated at payment page
+
+
+        challenge = get_challenge_from_session(self.request)
+        request.session['challenge_to_pay'] = request.session.get('tmp_reg_challenges', None)
+        buy_more_time = self.request.GET.get('extend_limit', False)
+        context['extend_limit'] = buy_more_time
+        if challenge and challenge.challenge_type.slug == 'name-your-own-prize'and not buy_more_time:
+            if user.is_user_in_nyop_challenge():
+                return HttpResponseRedirect("/dashboard/")
+            elif not request.session.get('nyop_payment_done', False):
+                # c = self.request.session.get('tmp_reg_challenges')
+                # return HttpResponseRedirect('/payments/' + str(c) + "/")
+                return HttpResponseRedirect(reverse('registration_register'))
+            elif not request.session.get('nyop_amount', False):
+                return HttpResponseRedirect(reverse('registration_register'))
+
+        if not request.GET.get('upgrade', False) and not request.session.get('upsell', False) and not request.session.get('from_campaign', False) and not request.session.get('nyop_amount', False) and not buy_more_time:
+            return HttpResponseRedirect(reverse('registration_register'))
+
+        payment_extras_form = PaymentExtrasForm(
+            request.GET,
+            request=self.request
+        )
+        context['payment_extras_form'] = payment_extras_form
+        context['organization'] = org
+
+        form_class = self.get_form_class()
+        form = self.get_form(form_class)
+        context['form'] = form
+
+        hide_installments = False
+        if self.challenge:
+            challenge_obj = Challenge.objects.get(id=self.challenge)
+            if challenge_obj.challenge_type.slug == 'bmi-challenge' or challenge_obj.challenge_type.slug == 'ten-percent-challenge':
+                hide_installments = True
+        context['hide_installments'] = hide_installments
+
+        return self.render_to_response(context)
+
+    def get_context_data(self, **kwargs):
+        context = super(FormView, self).get_context_data(**kwargs)
+        context['paymentmethod'] = self.request.POST.get('optionsRadios', None)
+        buy_more_time = self.request.GET.get('extend_limit', False)
+        user = self.request.user
+        if not user.is_authenticated():
+            return HttpResponseRedirect("/")
+        self.challenge = kwargs.get('challenge_id', None)
+        if self.challenge:
+            challenge = self.challenge
+            self.request.session['tmp_reg_challenges'] = self.challenge
+        else:
+            challenge = self.request.session.get('tmp_reg_challenges', False)
+
+        # check to see if this is an upgrade coming in
+        upgrade = self.request.GET.get('upgrade', False)
+        context['upgrade'] = False
+        if upgrade:
+            context['upgrade'] = True
+            self.request.session['upgrade'] = True
+
+        promotions = get_promos_from_session(self.request)
+        organization = self.request.session.get('tmp_reg_employer', False)
+        org_rel = self.request.session.get('tmp_reg_employer_relationship', False)
+
+        context['promotions'] = []
+
+        if promotions:
+            context['promotions'] = promotions
+
+        today = datetime.date.today()
+        org_promos = Promotion.objects.filter(
+            Q( organization_relationship=org_rel ) | Q(organization_relationship__isnull=True),
+            organizations=organization, start_date__lte = today, end_date__gte = today
+        )
+        if org_promos:
+            if challenge:
+                org_promos = org_promos.filter(challenges=challenge)
+
+            for promo in org_promos:
+                if promo not in context['promotions']:
+                    if promo.organization_relationship == org_rel or promo.organization_relationship is None:
+                        context['promotions'].append(promo)
+
+            promos_for_session = []
+            for promo in context['promotions']:
+                if promos_for_session:
+                    promos_for_session.append(promo.id)
+                else:
+                    promos_for_session = [promo.id]
+
+            self.request.session['tmp_reg_promotions'] = promos_for_session
+
+        # check is a challenge
+        if challenge:
+            challenge_obj = Challenge.objects.get(id=challenge)
+            context['challenge'] = challenge_obj
+
+            if challenge_obj.challenge_type.slug == "name-your-own-prize":
+                teammate = Teammate.objects.filter(participant=user, team__challenge__challenge_type__slug = 'name-your-own-prize', status__in=["ac", "cm", "de", "rp", "tt"])
+                if teammate and not buy_more_time:
+                    teammate = teammate[0]
+                    context['hwager_forfeit_challenge'] = teammate.hwager_forfeit_challenge()
+                if organization:
+                    org_promos = Promotion.objects.filter(
+                        organization_relationship__isnull=True,
+                        organizations=organization,
+                        challenges=challenge, start_date__lte = today, end_date__gte = today
+                    )
+
+                    for promo in org_promos:
+                        if promo not in context['promotions']:
+                            context['promotions'].append(promo)
+
+                    promos_for_session = []
+                    for promo in context['promotions']:
+                        if promos_for_session:
+                            promos_for_session.append(promo.id)
+                        else:
+                            promos_for_session = [promo.id]
+
+                    self.request.session['tmp_reg_promotions'] = promos_for_session
+            else:
+                # If user has active teammate record for this challenge, show registration stopper modal.
+                context['user_has_active_challenge'] = user.user_active_jackpot_challenge(challenge_obj)
+            # are the 100-bmi-challenge, if so send a context
+            # var to trigger showing the spinner on payments
+            if challenge_obj.bmi_required or challenge_obj.challenge_type.slug == "bmi-challenge":
+                context['bmi_challenge'] = True
+
+            chal_amount = self.amount()
+            if challenge_obj.challenge_type.slug == 'name-your-own-prize':
+                fee = chal_amount
+                context['fee'] = chal_amount
+                context['total_fee'] = chal_amount
+            else:
+                fee = challenge_obj.cost
+                context['total_fee'] = str(challenge_obj.cost)
+
+            context['sub_total'] = chal_amount
+            hw_points, remaining_balance, chal_amount, remaining_hw_point, hw_points_use = self.hw_point_calculation(fee, chal_amount)
+            context['fee'] = fee if fee else '0'
+            context['hw_points'] = hw_points
+            context['remaining_balance'] = remaining_balance if remaining_balance > 0 else 0
+            context['remaining_hw_point'] = remaining_hw_point
+            context['amount'] = chal_amount if chal_amount > 0 else 0
+            context['hw_points_use'] = hw_points_use
+
+            challenge_installment = challenge_obj.installment
+            if challenge_obj.challenge_type.slug == 'name-your-own-prize':
+                active_bet_id = self.request.session.get('nyop_bet_id',0)
+                context['active_bet'] = active_bet_id
+                active_bet = False
+                if buy_more_time:
+                    active_bet = self.request.user.nyop_teammate_active_bet()
+                    context['installment_amount'], context['odd_amount'] = process_installment_amounts(long(chal_amount), installments=HWGAER_EXTENSION_LENGTH)
+                    context['timeframe'] = HWGAER_EXTENSION_LENGTH
+                elif active_bet_id:
+                    active_bet = NameYourOwnPrize.objects.filter(pk=active_bet_id)
+                    if active_bet:
+                        active_bet = active_bet[0]
+                        context['installment_amount'], context['odd_amount'] = process_installment_amounts(long(chal_amount), installments=active_bet.length)
+                        context['timeframe'] = active_bet.length
+
+                if active_bet:
+                    context['active_bet_details'] = active_bet
+
+                    context['goal'] = active_bet.goal
+                    context['prize'] = active_bet.prize
+                    today = datetime.date.today()
+                    time_pass = today + relativedelta(months=active_bet.length)
+                    context['nyop_final_date'] = time_pass
+            else:
+                if challenge_installment in [0, 1]:
+                    context['hide_installment'] = True
+                else:
+                    context['number_of_installments'] = challenge_installment
+                    context['installment_amount'], context['odd_amount'] = process_installment_amounts(long(chal_amount), installments=challenge_installment)
+
+            context['braintree_redirect_url'] = settings.BRAINTREE_REDIRECT_URL
+            context['braintree_client_side_encryption_key'] = settings.BRAINTREE_CLIENT_SIDE_ENCRYPTION_KEY
+
+        if user.is_authenticated:
+            synchronizer_token = random.randint(1,999999999999)
+            if synchronizer_token:
+                context['synchronizer_token'] = synchronizer_token
+                self.request.session['synchronizer_token'] = synchronizer_token
+
+        return context
+
+
+class BuyMoreTimeView(FormView):
+    template_name = 'payments/buymoretime.html'
+    form_class = PaymentForm
+    success_url = '/payments/confirm/'
+
+    def use_hw_points(self, receipt=None):
+        # Find the amount of HW points user has
+        ledger = Ledger.objects.filter(participant=self.request.user).last()
+        hw_points = ledger.hwpoint_balance
+        # Create new ledger with HW points change
+        Ledger.objects.create(
+            participant=self.request.user,
+            status='vb',
+            entry_type='phw',
+            entry_creation='pm',
+            hwpoint_change=-hw_points,
+            hwpoint_balance=0,
+            entry_relative=receipt.id
+        )
+
+    def add_teammate_dates(self, teammate):
+        time_to_add = relativedelta(months=HWGAER_EXTENSION_LENGTH)
+        teammate.end_date += time_to_add
+        teammate.ending_verification_open_date += time_to_add
+        teammate.ending_verification_ending_date += time_to_add
+        teammate.winner_annoucement_date += time_to_add
+        teammate.save()
+
+        buy_more_time_logger.info(
+            "[ TEAMMATE END DATE ]  {}".format(teammate.end_date)
+        )
+        buy_more_time_logger.info(
+            "[ TEAMMATE ENDING VERIFICATION OPEN DATE ]  {}".format(teammate.ending_verification_open_date)
+        )
+        buy_more_time_logger.info(
+            "[ TEAMMATE ENDING VERIFICATION ENDING DATE ]  {}".format(teammate.ending_verification_open_date)
+        )
+        buy_more_time_logger.info(
+            "[ TEAMMATE WINNER ANNOUNCEMENT DATE ]  {}".format(teammate.winner_annoucement_date)
+        )
+
+    def unsuccessful_payment(self, challenge_id, payment_form, message):
+        buy_more_time_logger.error(
+            "[ PAYMENT UNSUCCESSFUL ]  {}".format(self.request.user)
+        )
+        buy_more_time_logger.error(
+            "[ BRAINTREE ERROR MESSAGE ]  {}".format(message)
+        )
+        PaymentRequestLog.objects.create(
+            user=self.request.user.id,
+            challenge=challenge_id,
+            status=message[:250],
+            method="new-card",
+        )
+
+        # Show error messages to user
+        errors = payment_form._errors.setdefault(NON_FIELD_ERRORS, ErrorList())
+        errors.append(_(
+            'Card could not be processed. Please make sure you have entered' +
+            ' the numbers (including CVV) correctly or call your bank for additional details'))
+
+        return errors
+
+    def get_context_data(self, **kwargs):
+        context = super(FormView, self).get_context_data(**kwargs)
+        # Configure BrainTree for payments
+        braintree.Configuration.configure(settings.BRAINTREE_ENV,
+                                          merchant_id=settings.BRAINTREE_MERCHANT,
+                                          public_key=settings.BRAINTREE_PUBLIC_KEY,
+                                          private_key=settings.BRAINTREE_PRIVATE_KEY)
+        active_bet = self.request.user.nyop_teammate_active_bet()
+        challenge_cost = (active_bet.wager * HWGAER_EXTENSION_LENGTH)
+        # If user has HW points
+        hw_points = 0
+        ledger = Ledger.objects.filter(participant=self.request.user).last()
+        if ledger:
+            hw_points = ledger.hwpoint_balance
+
+        challenge_cost = challenge_cost - hw_points
+
+        today = datetime.date.today()
+        nyop_final_date = today + relativedelta(months=active_bet.length)
+        installment_amount, odd_amount = process_installment_amounts(
+            long(challenge_cost), installments=HWGAER_EXTENSION_LENGTH)
+
+        if odd_amount:
+            self.request.session['odd_amount'] = odd_amount
+            self.request.session['installment_amount'] = installment_amount
+
+        sync_token = braintree.ClientToken.generate()
+        self.request.session['active_bet'] = active_bet.id
+        self.request.session['nyop_amount'] = challenge_cost
+        self.request.session['synchronizer_token'] = sync_token
+        self.request.session['tmp_reg_challenges'] = 57
+
+        promotions = get_promos_from_session(self.request)
+
+        teammate = Teammate.objects.filter(team__challenge__challenge_type__slug='name-your-own-prize',
+                                           participant=self.request.user, status__in=["ac", "cm", "de", "rp", "tt"])
+        if teammate:
+            teammate = teammate[0]
+            prize = float(teammate.total_payout_for_hwager())
+        else:
+            prize = active_bet.wager
+
+        prize_after_point = "{:.2f}".format(round(prize, 2))
+        prize_after_point = prize_after_point.split('.', 2)[1]
+
+        additional_context = {
+            'fee': challenge_cost + hw_points,
+            'total_fee': challenge_cost,
+            'sub_total': challenge_cost,
+            'amount': challenge_cost,
+            'remaining_balance': challenge_cost,
+            'challenge': Challenge.objects.get(id=57),
+            'challenge_id': 57,
+            'promotions': promotions,
+            'timeframe': HWGAER_EXTENSION_LENGTH,
+            'goal': active_bet.goal,
+            'prize': int(prize),
+            'prize_after_point': prize_after_point,
+            'active_bet': active_bet.id,
+            'active_bet_details': active_bet,
+            'braintree_redirect_url': settings.BRAINTREE_REDIRECT_URL,
+            'braintree_client_side_encryption_key': settings.BRAINTREE_CLIENT_SIDE_ENCRYPTION_KEY,
+            'nyop_final_date': nyop_final_date,
+            'installment_amount': int(installment_amount),
+            'odd_amount': odd_amount,
+            'number_of_installments': HWGAER_EXTENSION_LENGTH,
+            # 'remaining_hw_point': hw_points,
+            'synchronizer_token': sync_token,
+            'hw_points': hw_points,
+            'hw_points_use': 0,
+            'extend_limit': True,
+        }
+        context.update(additional_context)
+        return context
+
+    def get_form(self, form_class):
+        # pay_amount of HealthyWager aka NameYourOwnPrize
+        active_bet = self.request.user.nyop_teammate_active_bet()
+        challenge_cost = (active_bet.wager * HWGAER_EXTENSION_LENGTH)
+
+        payment_form = form_class(
+            self.request.POST or None,
+            self.request.FILES or None,
+            request=self.request,
+            amount=challenge_cost
+        )
+        return payment_form
+
+    def get(self, request, *args, **kwargs):
+        # User must be authenticated
+        user = request.user
+        if not user.is_authenticated():
+            return HttpResponseRedirect("/")
+
+        context = self.get_context_data(**kwargs)
+
+        # Check if user paid with installments or all at once
+        # If paid with installments - do not show order summary form
+        # If there is no saved card - show order summary
+
+        # Find active teammate record for user
+        teammate = Teammate.objects.filter(
+            participant=user,
+            team__challenge__challenge_type__slug='name-your-own-prize',
+            status__in=["ac", "tt"]
+        ).first()
+
+        # If user has subscriptions - means she paid with installments
+        subscription = Subscription.objects.filter(
+            participant=user,
+            teammate=teammate,
+            teammate__team__challenge__slug='name-your-own-prize'
+        ).last()
+        # Check if user has the card saved or not
+        credit_card = CreditCard.objects.filter(participant=user)
+
+        if subscription and credit_card:
+            show_order_summary = False
+        else:
+            show_order_summary = True
+
+        context['show_order_summary'] = show_order_summary
+
+        if show_order_summary:
+            form_class = self.get_form_class()
+            form = self.get_form(form_class)
+            payment_extras_form = PaymentExtrasForm(
+                request.GET,
+                request=self.request
+            )
+            context['payment_extras_form'] = payment_extras_form
+            context['form'] = form
+
+        return self.render_to_response(context)
+
+    def post(self, request, *args, **kwargs):
+        # Two cases - if user had order summary form, or he didn't
+        # If user had order summary form - two more cases
+        user = request.user
+
+        # Find user's teammate record
+        teammate = Teammate.objects.filter(
+            participant=user,
+            team__challenge__challenge_type__slug='name-your-own-prize',
+            status__in=["ac", "cm", "de", "rp", "tt"]) \
+            .first()
+
+        first_name = request.POST.get('first_name', None)
+        challenge = Challenge.objects.get(id=57)
+
+        today = datetime.datetime.today()
+
+        buy_more_time_logger.info(
+            "[ === START BUY MORE TIME === ]  User: {} Date: {}".format(user, today)
+        )
+
+        buy_more_time_logger.info(
+            "[ POSTED DATA ] {}".format(json.dumps(request.POST))
+        )
+
+        # If parameter first_name exists - the user saw order_summary form
+        # This is tricky, pay attention
+        if first_name:
+            # Get form data
+            last_name = request.POST.get('last_name', None)
+            expiration_month = request.POST.get('expiration_month', None)
+            expiration_year = request.POST.get('expiration_year', None)
+            credit_card_number = request.POST.get('number', None)
+            cvv = request.POST.get('cvv', None)
+            postal_code = request.POST.get('postal_code', None)
+            amount = request.POST.get('amount', '0')
+            payment_type = request.POST.get('optionsRadios', 'single')
+            save_card = request.POST.get('save_this_card', 'off')
+
+            if payment_type == 'installment':
+                # Divide the amount by months
+                installment_amount, odd_payment = process_installment_amounts(float(amount), HWGAER_EXTENSION_LENGTH)
+                if odd_payment:
+                    amount = u"%s" % ("{0:.2f}".format(odd_payment))
+                else:
+                    amount = u"%s" % ("{0:.2f}".format(installment_amount))
+
+                if 'odd_amount' in request.session:
+                    amount = int(request.session['odd_amount'])
+
+            if 'payment_confirmation' not in request.session:
+                request.session['payment_confirmation'] = dict()
+
+            request.session['payment_confirmation']['amount'] = amount
+            buy_more_time_logger.info(
+                "[ AMOUNT ] {}".format(amount)
+            )
+
+            save_card = True if save_card == 'on' else False
+
+            # Get form
+            form_class = self.get_form_class()
+            form = self.get_form(form_class)
+
+            # 1. User chose to pay w/ installments
+            # Process payment as usual and charge first installment right away
+            if payment_type == 'installment':
+                # If there are no errors in form
+                if form.is_valid():
+                    buy_more_time_logger.info(
+                        "[ === PAYMENT WITH INSTALLMENTS === ]"
+                    )
+                    user_result = braintree.Customer.create({
+                        "first_name": first_name,
+                        "last_name": last_name,
+                    })
+                    buy_more_time_logger.info(
+                        "[ BRAINTREE CUSTOMER ] {}".format(user_result)
+                    )
+
+                    # If user decided to save the card
+                    # Form transaction details
+                    transaction_details = {
+                        "amount": amount,
+                        "customer_id": user_result.customer.id,
+                        "credit_card": {
+                            "number": credit_card_number,
+                            "expiration_month": expiration_month,
+                            "expiration_year": expiration_year,
+                            "cvv": cvv,
+                            "cardholder_name": first_name + ' ' + last_name,
+                        },
+                        "options": {
+                            "store_in_vault": True,
+                            "submit_for_settlement": True,
+                        }
+                    }
+
+                    # Perform payment transaction
+                    result = braintree.Transaction.sale(transaction_details)
+
+                    # If payment transaction was successful
+                    if result.is_success:
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE TRANSACTION SUCCESS ] {}".format(result.is_success)
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE TRANSACTION AMOUNT ] {}".format(result.transaction.amount)
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE CUSTOMER ID ] {}".format(result.transaction.customer_details.id)
+                        )
+
+                        PaymentRequestLog.objects.create(
+                            user=user.id,
+                            challenge=challenge.id,
+                            status="payment-successful",
+                            method="new-card"
+                        )
+
+                        # Saving card (we need it to create subscription)
+                        credit_card, credit_card_created = CreditCard.objects.get_or_create(
+                            participant=self.request.user,
+                            token=result.transaction.credit_card['token'],
+                            last_four=result.transaction.credit_card['last_4'],
+                            type=result.transaction.credit_card['card_type'],
+                            cardholder=result.transaction.credit_card['cardholder_name'],
+                            postal_code=postal_code,
+                            expiration_month=result.transaction.credit_card['expiration_month'],
+                            expiration_year=result.transaction.credit_card['expiration_year']
+                        )
+                        # Add time to user's challenge dates
+                        self.add_teammate_dates(teammate=teammate)
+
+                        # Create an extension record for stats
+                        HwagerExtension.objects.create(
+                            teammate=teammate,
+                            length=HWGAER_EXTENSION_LENGTH,
+                            amount=amount,
+                            date_of_extension=today
+                        )
+
+                        # Create subscription
+                        # If user had HW points - use them
+                        if 'installment_amount' in request.session:
+                            amount = int(request.session['installment_amount'])
+
+                        subscription = Subscription.objects.create(
+                            amount=amount,
+                            teammate=teammate,
+                            installments=HWGAER_EXTENSION_LENGTH - 1,
+                            status='a',
+                            participant=request.user,
+                            card=credit_card,
+                            last_payment_date=today
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ CREATED SUBSCRIPTION ] {}".format(subscription)
+                        )
+
+                        # Create new receipt
+                        # 1. Find old receipt installments number
+                        last_receipt = Receipt.objects.filter(
+                            status__in=['paid', 'test'],
+                            teammate=teammate,
+                        ).order_by('-pk').last()
+                        receipt_installment_number = last_receipt.installment_number + 1
+
+                        # 2. Create new receipt with installments number + 1
+                        new_receipt = Receipt.objects.create(
+                            participant=user,
+                            teammate=teammate,
+                            subscription=subscription,
+                            hw_points=0,
+                            cash_amount=transaction_details['amount'],
+                            amount=transaction_details['amount'],
+                            pay_method=payment_type,
+                            installment_number=receipt_installment_number,
+                            last_four=result.transaction.credit_card['last_4'],
+                            card_type=result.transaction.credit_card['card_type'],
+                            transaction_id=result.transaction.id
+                        )
+
+                        # If user paid with installments with odd_amount - remove points and create new Ledger
+                        if 'odd_amount' in request.session:
+                            self.use_hw_points(receipt=new_receipt)
+
+                        buy_more_time_logger.info(
+                            "[ NEW RECEIPT ] {}".format(new_receipt)
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ === FINISH BUY MORE TIME === ]"
+                        )
+
+                        request.session['event_tracking'] = True
+                        request.session['amount'] = amount
+                        request.session['fee'] = str(float(amount) * HWGAER_EXTENSION_LENGTH)
+                        request.session['payment_confirmation']['total'] = amount
+                        request.session['payment_confirmation']['fee'] = str(float(amount) * HWGAER_EXTENSION_LENGTH)
+                        request.session['payment_confirmation']['total_fee'] = amount
+                        request.session['payment_confirmation']['sub_total'] = amount
+                        request.session['payment_confirmation']['payment_option'] = 'installment'
+                        request.session['payment_confirmation']['timeframe'] = HWGAER_EXTENSION_LENGTH
+
+                        return redirect("/payments/confirm/" + str(challenge.id))
+
+                    # Payment transaction unsuccessful
+                    else:
+                        errors = self.unsuccessful_payment(challenge_id=challenge.id, payment_form=form, message=result.message)
+                        payment_extras_form = PaymentExtrasForm(request.GET, request=self.request)
+                        kwargs['payment_extras_form'] = payment_extras_form
+                        return self.render_to_response(
+                            self.get_context_data(
+                                form=form,
+                                payment_extras_form=payment_extras_form
+                            )
+                        )
+
+            # 2. User chose to pay all at once
+            # Process payment as usual and charge the user right away
+            else:
+                # If there are no errors in form
+                if form.is_valid():
+                    buy_more_time_logger.info(
+                        "[ === PAYMENT AT ONCE === ]"
+                    )
+
+                    user_result = braintree.Customer.create({
+                        "first_name": form.cleaned_data['first_name'],
+                        "last_name": form.cleaned_data['last_name'],
+                    })
+
+                    buy_more_time_logger.info(
+                        "[ BRAINTREE CUSTOMER ] {}".format(user_result)
+                    )
+                    # If user decided to save the card
+                    if save_card:
+                        # Form transaction details
+                        transaction_details = {
+                            "amount": amount,
+                            "customer_id": user_result.customer.id,
+                            "credit_card": {
+                                "number": credit_card_number,
+                                "credit_card_number": expiration_month,
+                                "expiration_year": expiration_year,
+                                "cvv": cvv,
+                                "cardholder_name": first_name + ' ' + last_name,
+                            },
+                            "options": {
+                                "store_in_vault": True,
+                                "submit_for_settlement": True,
+                            }
+                        }
+                    else:
+                        transaction_details = {
+                            "amount": amount,
+                            "customer_id": user_result.customer.id,
+                            "credit_card": {
+                                "number": credit_card_number,
+                                "expiration_month": expiration_month,
+                                "expiration_year": expiration_year,
+                                "cvv": cvv,
+                                "cardholder_name": first_name + ' ' + last_name,
+                            },
+                            "options": {
+                                "submit_for_settlement": True,
+                            }
+                        }
+
+                    # Perform payment transaction
+                    result = braintree.Transaction.sale(transaction_details)
+
+                    # If payment transaction was successful
+                    if result.is_success:
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE TRANSACTION SUCCESS ] {}".format(result.is_success)
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE TRANSACTION AMOUNT ] {}".format(result.transaction.amount)
+                        )
+
+                        buy_more_time_logger.info(
+                            "[ BRAINTREE CUSTOMER ID ] {}".format(result.transaction.customer_details.id)
+                        )
+
+                        PaymentRequestLog.objects.create(
+                            user=user.id,
+                            challenge=challenge.id,
+                            status="payment-successful",
+                            method="new-card"
+                        )
+                        request.session['event_tracking'] = True
+
+                        # If user decided to save the card
+                        if save_card:
+                            CreditCard.objects.get_or_create(
+                                participant=self.request.user,
+                                token=result.transaction.credit_card['token'],
+                                last_four=result.transaction.credit_card['last_4'],
+                                type=result.transaction.credit_card['card_type'],
+                                cardholder=result.transaction.credit_card['cardholder_name'],
+                                postal_code=postal_code,
+                                expiration_month=result.transaction.credit_card['expiration_month'],
+                                expiration_year=result.transaction.credit_card['expiration_year']
+                            )
+
+                        # Add time to user's challenge dates
+                        self.add_teammate_dates(teammate=teammate)
+
+                        # Create an extension record for stats
+                        HwagerExtension.objects.create(
+                            teammate=teammate,
+                            length=HWGAER_EXTENSION_LENGTH,
+                            amount=amount,
+                            date_of_extension=today
+                        )
+
+                        # Create new receipt
+                        # 1. Find old receipt installments number
+                        last_receipt = Receipt.objects.filter(
+                            status__in=['paid', 'test'],
+                            teammate=teammate,
+                        ).order_by('-pk').last()
+                        receipt_installment_number = last_receipt.installment_number + 1
+
+                        # 2. Create new receipt with installments number + 1
+                        new_receipt = Receipt.objects.create(
+                            participant=user,
+                            teammate=teammate,
+                            hw_points=0,
+                            cash_amount=transaction_details['amount'],
+                            amount=transaction_details['amount'],
+                            pay_method=payment_type,
+                            installment_number=receipt_installment_number
+                        )
+
+                        request.session['payment_confirmation']['total'] = amount
+
+                        buy_more_time_logger.info(
+                            "[ NEW RECEIPT ] {}".format(new_receipt)
+                        )
+
+                        request.session['event_tracking'] = True
+                        request.session['amount'] = amount
+                        request.session['fee'] = amount
+                        request.session['payment_confirmation']['total'] = amount
+                        request.session['payment_confirmation']['fee'] = amount
+                        request.session['payment_confirmation']['total_fee'] = amount
+                        request.session['payment_confirmation']['sub_total'] = amount
+
+                        buy_more_time_logger.info(
+                            "[ === FINISH BUY MORE TIME === ]"
+                        )
+                    # If payment transaction was unsuccessful
+                    else:
+                        errors = self.unsuccessful_payment(challenge_id=challenge.id, payment_form=form, message=result.message)
+                        payment_extras_form = PaymentExtrasForm(request.GET, request=self.request)
+                        kwargs['payment_extras_form'] = payment_extras_form
+                        return self.render_to_response(
+                            self.get_context_data(
+                                form=form,
+                                payment_extras_form=payment_extras_form
+                            )
+                        )
+
+        # User chose to pay w/ installments previously
+        # User didn't see order summary
+        # Add installments and redirect to dashboard
+        else:
+            buy_more_time_logger.info(
+                "[ === ADD {} TO EXISTING INSTALLMENTS === ] ".format(HWGAER_EXTENSION_LENGTH)
+            )
+            active_bet_id = request.session.get('active_bet', None)
+            active_bet = NameYourOwnPrize.objects.get(pk=active_bet_id, participant=user)
+
+            buy_more_time_logger.info(
+                "[ AMOUNT TO PAY PER INSTALLMENT ] {}".format(active_bet.wager)
+            )
+
+            # Update subscription record with more installments
+            subscription = Subscription.objects.filter(teammate=teammate).first()
+            subscription.installments = subscription.installments + HWGAER_EXTENSION_LENGTH
+            subscription.status = 'a'
+            subscription.save()
+
+            # Create extension record for statistics
+            HwagerExtension.objects.create(
+                teammate=teammate,
+                subscription=subscription,
+                length=HWGAER_EXTENSION_LENGTH,
+                amount=active_bet.wager,
+                date_of_extension=today
+            )
+
+            # Add time to user's challenge dates
+            self.add_teammate_dates(teammate=teammate)
+
+            buy_more_time_logger.info(
+                "[ === FINISH BUY MORE TIME === ]"
+            )
+
+            # Do not show payment confirmation page and redirect user back to dashboard
+            return redirect("/dashboard/" + str(challenge.id) + "/")
+
+        # Send user to payment confirmation page
+        payment_extras_form = PaymentExtrasForm(request.GET, request=self.request)
+        kwargs['payment_extras_form'] = payment_extras_form
+
+        return redirect("/payments/confirm/" + str(challenge.id) + "/")
+
+
+# DEV - 1041 Update referral System
+def referrals_activate(request, unique_id, challenge_type, challenge_slug, social_method=False, extra_context=None,
+                       **kwargs):
+    len_uid = len(unique_id)
+    hw_id = unique_id[0:len_uid - 5]
+    Cid = unique_id[len_uid - 5:len_uid]
+    utm_code = request.GET.urlencode()
+
+    request.session['ref_active_hw_id'] = hw_id
+    challenge = False
+    if challenge_type == 'healthywager':
+        challenge_type = 'name-your-own-prize'
+
+    try:
+        referrer_team = Teammate.objects.get(participant__healthywage_id=hw_id, team__challenge__id=Cid,
+                                             status__in=['ac', 'cm', 'wi', 'rp', 'cl', 'tt'])
+        request.session['ref_active_Cid'] = referrer_team.team.challenge.id
+        request.session['unique_id'] = unique_id
+        challenge = Challenge.objects.get(pk=Cid)
+        challenge_type_id = challenge.challenge_type.id
+    except:
+        referrer_team = Teammate.objects.filter(participant__healthywage_id=hw_id,
+                                                status__in=['ac', 'cm', 'wi', 'rp', 'cl', 'tt'],
+                                                team__challenge__challenge_type__slug=challenge_type).order_by(
+            '-end_date')
+        if referrer_team:
+            referrer_team = referrer_team[0]
+            challenge = referrer_team.team.challenge
+            challenge_type_id = challenge.challenge_type.id
+            request.session['ref_active_Cid'] = challenge.id
+            challenge_id_five_digit = str(challenge.id).rjust(5, '0')
+            unique_id = hw_id + challenge_id_five_digit
+            request.session['ref_active_Cid'] = challenge.id
+            request.session['unique_id'] = unique_id
+
+    if unique_id and challenge:
+        if challenge_type == 'name-your-own-prize':
+            request.session[
+                'referral_url'] = "/" + "referral" + "/" + "healthywager" + "/" + challenge.slug + "/" + unique_id
+            request.session['nyop_referral_lp'] = True
+        else:
+            request.session[
+                'referral_url'] = "/" + "referral" + "/" + challenge.challenge_type.slug + "/" + challenge.slug + "/" + unique_id
+
+    if social_method == '001':
+        request.session['ref_active_social_method'] = "copy-and-paste"
+    elif social_method == '002':
+        request.session['ref_active_social_method'] = "facebook"
+    elif social_method == '003':
+        request.session['ref_active_social_method'] = "twitter"
+    else:
+        request.session['ref_active_social_method'] = "copy-and-paste"
+
+    if challenge_type == 'name-your-own-prize':
+        if utm_code:
+            return redirect('/weight-loss-bet/name-your-own-prize/?' + str(utm_code))
+        else:
+            return redirect('/weight-loss-bet/name-your-own-prize/')
+
+    else:
+        if referrer_team:
+            lps_client = LandingPage.objects.filter(challenge_type=challenge_type_id, challenge=Cid,
+                                                    client=referrer_team.organization.id, status=1).order_by(
+                '-pk') if referrer_team.organization else None
+            lps_primary = LandingPage.objects.filter(challenge_type=challenge_type_id, challenge=Cid,
+                                                     primary_landing_page=1, status=1).order_by('-pk')
+            if lps_client:
+                lps_client = lps_client[0]
+
+            if lps_primary:
+                lps_primary = lps_primary[0]
+
+            if referrer_team.organization:
+                if Cid:
+                    tc = Challenge.objects.filter(id=Cid, challenge_type__slug=challenge_type,
+                                                  organizations=referrer_team.organization)
+                else:
+                    tc = Challenge.objects.filter(challenge_type__slug=challenge_type,
+                                                  organizations=referrer_team.organization)
+                landing_page = lps_client if tc and lps_client else lps_primary
+            else:
+                landing_page = lps_primary
+
+            if landing_page and landing_page.namespace and landing_page.slug:
+                if utm_code:
+                    return redirect('/' + landing_page.namespace + '/' + landing_page.slug + '/?' + str(utm_code))
+                else:
+                    return redirect('/' + landing_page.namespace + '/' + landing_page.slug + '/')
+            elif landing_page and landing_page.namespace:
+                if utm_code:
+                    return redirect('/' + landing_page.namespace + '/?' + str(utm_code))
+                else:
+                    return redirect('/' + landing_page.namespace + '/')
+            elif challenge_type == 'team-challenge':
+                if utm_code:
+                    return redirect('/diet-contest/team-challenge/?' + str(utm_code))
+                else:
+                    return redirect('/diet-contest/team-challenge/')
+            else:
+                if utm_code:
+                    return redirect('/?' + str(utm_code))
+                else:
+                    return redirect('/')
+        else:
+            if utm_code:
+                return redirect('/?' + str(utm_code))
+            else:
+                return redirect('/')
